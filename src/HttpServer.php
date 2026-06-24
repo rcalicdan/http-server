@@ -260,7 +260,7 @@ final class HttpServer implements HttpServerInterface
         Loop::run();
     }
 
-    /**
+   /**
      * Run the server in clustered mode across multiple CPU cores.
      */
     private function runCluster(int $workers, callable $requestHandler): void
@@ -271,19 +271,8 @@ final class HttpServer implements HttpServerInterface
         if (! isset($context['tcp']) || ! \is_array($context['tcp'])) {
             $context['tcp'] = [];
         }
+        
         $context['tcp']['so_reuseport'] = true;
-
-        $pool = Parallel::pool(size: $workers)->withoutTimeout()->boot();
-
-        if ($this->workerMemoryLimit !== null) {
-            $pool = $pool->withMemoryLimit($this->workerMemoryLimit);
-        }
-
-        if ($this->bootstrapFile !== null) {
-            $pool = $pool->withBootstrap($this->bootstrapFile, $this->bootstrapCallback);
-        }
-
-        $pids = $pool->getWorkerPids();
 
         $workerTask = new ServerWorkerTask(
             $this->uri,
@@ -294,24 +283,30 @@ final class HttpServer implements HttpServerInterface
         );
 
         $onWorkerError = function (\Throwable $e): void {
-            $this->log(\sprintf(
+            $this->log(sprintf(
                 "CRITICAL: Worker Task Failed!\n" .
-                    "Exception: %s\n" .
-                    "Message: %s\n" .
-                    "Stack Trace:\n%s\n",
+                "Exception: %s\n" .
+                "Message: %s\n" .
+                "Stack Trace:\n%s\n",
                 get_class($e),
                 $e->getMessage(),
                 $e->getTraceAsString()
             ));
         };
 
-        for ($i = 0; $i < $workers; $i++) {
-            $pool->run($workerTask)->catch($onWorkerError);
+        $pool = Parallel::pool(size: $workers)->withoutTimeout();
+
+        if ($this->workerMemoryLimit !== null) {
+            $pool = $pool->withMemoryLimit($this->workerMemoryLimit);
         }
 
-        $pool->onWorkerRespawn(function ($pool) use ($workerTask, $onWorkerError) {
-            $this->log('ALERT: Worker process died or retired! Respawning replacement worker...');
+        if ($this->bootstrapFile !== null) {
+            $pool = $pool->withBootstrap($this->bootstrapFile, $this->bootstrapCallback);
+        }
 
+        $pool = $pool->onWorkerRespawn(function ($pool) use ($workerTask, $onWorkerError) {
+            $this->log('ALERT: Worker process died or retired! Respawning replacement worker...');
+            
             $pool->run($workerTask)->catch($onWorkerError);
 
             Loop::nextTick(function () use ($pool) {
@@ -319,6 +314,13 @@ final class HttpServer implements HttpServerInterface
                 $this->log('Active Worker PIDs: ' . implode(', ', $pids));
             });
         });
+
+        $pool = $pool->boot();
+        $pids = $pool->getWorkerPids();
+
+        for ($i = 0; $i < $workers; $i++) {
+            $pool->run($workerTask)->catch($onWorkerError);
+        }
 
         $this->setupSignalHandlers(function () use ($pool) {
             $this->log("\nGracefully shutting down cluster...");
