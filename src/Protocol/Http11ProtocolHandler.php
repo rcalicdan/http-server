@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Hibla\HttpServer\Protocol;
 
+use Hibla\HttpServer\Exceptions\MessageParsingException;
+use Hibla\HttpServer\Exceptions\PayloadTooLargeException;
 use Hibla\HttpServer\Interfaces\ProtocolHandlerInterface;
 use Hibla\HttpServer\Message\Request;
 use Hibla\HttpServer\Message\RequestBodyStream;
@@ -238,7 +240,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
         try {
             $this->parseHeaders($rawHeaders);
-        } catch (\LengthException $e) {
+        } catch (PayloadTooLargeException $e) {
             $this->sendErrorAndClose(413, 'Payload Too Large');
 
             return false;
@@ -435,8 +437,8 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
      *
      * @param string $rawHeaders The raw HTTP header string including the request line.
      *
-     * @throws \InvalidArgumentException If any structural validation fails.
-     * @throws \LengthException If the calculated Content-Length exceeds the configured maximum body size.
+     * @throws MessageParsingException If any structural validation fails.
+     * @throws PayloadTooLargeException If the calculated Content-Length exceeds the configured maximum body size.
      */
     private function parseHeaders(string $rawHeaders): void
     {
@@ -448,23 +450,23 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         }
 
         if ($requestLine === '') {
-            throw new \InvalidArgumentException('Empty request line');
+            throw new MessageParsingException('Empty request line');
         }
 
         $parts = explode(' ', $requestLine);
         if (\count($parts) !== 3) {
-            throw new \InvalidArgumentException('Invalid Request Line');
+            throw new MessageParsingException('Invalid Request Line');
         }
 
         if (preg_match('/^HTTP\/\d\.\d$/', $parts[2]) !== 1) {
-            throw new \InvalidArgumentException('Invalid HTTP version: must match HTTP/DIGIT.DIGIT');
+            throw new MessageParsingException('Invalid HTTP version: must match HTTP/DIGIT.DIGIT');
         }
 
         $headers = [];
 
         foreach ($lines as $line) {
             if ($line !== '' && ($line[0] === ' ' || $line[0] === "\t")) {
-                throw new \InvalidArgumentException('Obsolete line folding (obs-fold) is not permitted in requests');
+                throw new MessageParsingException('Obsolete line folding (obs-fold) is not permitted in requests');
             }
 
             $colonPos = strpos($line, ':');
@@ -476,7 +478,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             $fieldValue = trim(substr($line, $colonPos + 1));
 
             if ($rawFieldName !== rtrim($rawFieldName)) {
-                throw new \InvalidArgumentException("Whitespace before colon is not permitted in field name: \"{$rawFieldName}\"");
+                throw new MessageParsingException("Whitespace before colon is not permitted in field name: \"{$rawFieldName}\"");
             }
 
             $headers[strtolower($rawFieldName)][] = $fieldValue;
@@ -486,10 +488,10 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
         if ($protocolVersion === '1.1') {
             if (! isset($headers['host'])) {
-                throw new \InvalidArgumentException('HTTP/1.1 requests MUST include a Host header field');
+                throw new MessageParsingException('HTTP/1.1 requests MUST include a Host header field');
             }
             if (\count($headers['host']) > 1) {
-                throw new \InvalidArgumentException('HTTP/1.1 requests MUST NOT contain more than one Host header field');
+                throw new MessageParsingException('HTTP/1.1 requests MUST NOT contain more than one Host header field');
             }
         }
 
@@ -522,7 +524,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             $uniqueCl = array_unique($clRaw);
 
             if (\count($uniqueCl) > 1) {
-                throw new \InvalidArgumentException('Multiple conflicting Content-Length values');
+                throw new MessageParsingException('Multiple conflicting Content-Length values');
             }
 
             $this->expectedBodyLength = (int) reset($uniqueCl);
@@ -547,7 +549,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         }
 
         if (! $this->streamingRequests && $this->expectedBodyLength > $this->maxBodySize) {
-            throw new \LengthException('Payload Too Large');
+            throw new PayloadTooLargeException('Payload Too Large');
         }
     }
 

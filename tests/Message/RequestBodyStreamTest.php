@@ -148,5 +148,6 @@ it('pipes pushed data to a real WritableStreamInterface', function () {
     $readable->push('Chunk 2');
     $readable->end();
     expect($writable->receivedBuffer)->toBe('Chunk 1 Chunk 2')
-        ->and($writable->isWritable())->toBeFalse();
+        ->and($writable->isWritable())->toBeFalse()
+    ;
 });

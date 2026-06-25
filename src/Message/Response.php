@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Hibla\HttpServer\Message;
 
 use Hibla\EventLoop\Loop;
+use Hibla\HttpServer\Exceptions\JsonEncodingException;
 use Hibla\Stream\Interfaces\ReadableStreamInterface;
 
 /**
@@ -115,7 +116,7 @@ final class Response extends AbstractMessage
         );
 
         if (! \is_string($json)) {
-            throw new \InvalidArgumentException('Unable to encode given data as JSON: ' . json_last_error_msg());
+            throw new JsonEncodingException('Unable to encode given data as JSON: ' . json_last_error_msg());
         }
 
         return new self($status, ['content-type' => 'application/json'], $json . "\n");

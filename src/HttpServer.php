@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Hibla\HttpServer;
 
 use Hibla\EventLoop\Loop;
+use Hibla\HttpServer\Exceptions\InvalidConfigurationException;
+use Hibla\HttpServer\Exceptions\InvalidResponseException;
 use Hibla\HttpServer\Interfaces\HttpServerInterface;
 use Hibla\HttpServer\Interfaces\ProtocolHandlerInterface;
 use Hibla\HttpServer\Internals\ServerWorkerTask;
@@ -133,7 +135,7 @@ final class HttpServer implements HttpServerInterface
     public function withCluster(int $workers): static
     {
         if ($workers <= 1) {
-            throw new \InvalidArgumentException('Cluster mode requires at least 2 workers.');
+            throw new InvalidConfigurationException('Cluster mode requires at least 2 workers.');
         }
 
         $clone = clone $this;
@@ -414,10 +416,12 @@ final class HttpServer implements HttpServerInterface
             $protocolHandler = new Http11ProtocolHandler($connection, function (Request $request, ProtocolHandlerInterface $protocol) use ($requestHandler) {
                 $fiber = new \Fiber(function () use ($requestHandler, $request, $protocol) {
                     try {
-                        $response = $requestHandler($request);
+                        $response = $requestHandler($request, $protocol);
+
                         if (! $response instanceof Response) {
-                            throw new \LogicException('Request handler must return an instance of Response');
+                            throw new InvalidResponseException('Request handler must return an instance of Response');
                         }
+
                         $protocol->writeResponse($response);
                     } catch (\Throwable $e) {
                         try {

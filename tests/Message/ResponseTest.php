@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Hibla\HttpServer\Exceptions\JsonEncodingException;
 use Hibla\HttpServer\Message\Response;
 use Hibla\HttpServer\Message\SseStream;
 use Hibla\Stream\Interfaces\ReadableStreamInterface;
@@ -83,7 +84,7 @@ it('throws an exception on invalid json data', function () {
     $resource = fopen('php://memory', 'r');
 
     expect(fn () => Response::json($resource))
-        ->toThrow(InvalidArgumentException::class, 'Unable to encode given data as JSON')
+        ->toThrow(JsonEncodingException::class, 'Unable to encode given data as JSON')
     ;
 });
 
@@ -149,5 +150,6 @@ it('can accept a readable stream as a response body', function () {
     $response->setBody($dummyStream);
 
     expect($response->getBody())->toBeInstanceOf(ReadableStreamInterface::class)
-        ->and($response->getBody())->toBe($dummyStream);
+        ->and($response->getBody())->toBe($dummyStream)
+    ;
 });

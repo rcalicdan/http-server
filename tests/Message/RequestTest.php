@@ -98,5 +98,6 @@ it('can accept a readable stream object as the body', function () {
     $request->setBody($dummyStream);
 
     expect($request->getBody())->toBeInstanceOf(ReadableStreamInterface::class)
-        ->and($request->getBody())->toBe($dummyStream);
+        ->and($request->getBody())->toBe($dummyStream)
+    ;
 });
