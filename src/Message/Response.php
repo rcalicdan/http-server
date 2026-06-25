@@ -9,11 +9,8 @@ use Hibla\Stream\Interfaces\ReadableStreamInterface;
 
 /**
  * Concrete implementation of an outgoing HTTP Response DTO.
- *
- * This class represents an outgoing HTTP response message, defining methods to
- * inspect and mutate the HTTP status code, headers, and the response body payload.
  */
-final class Response
+final class Response extends AbstractMessage
 {
     /**
      * @var array<int, string> Map of standard HTTP status codes to reason phrases.
@@ -77,11 +74,6 @@ final class Response
     ];
 
     /**
-     * @var array<string, list<string>> Normalized request headers
-     */
-    public array $headers = [];
-
-    /**
      * @param int $statusCode
      * @param array<string, string|list<string>> $headers
      * @param string|ReadableStreamInterface $body
@@ -91,27 +83,21 @@ final class Response
     public function __construct(
         public int $statusCode = 200,
         array $headers = [],
-        public string|ReadableStreamInterface $body = '',
+        string|ReadableStreamInterface $body = '',
         public string $reasonPhrase = '',
-        public string $protocolVersion = '1.1'
+        string $protocolVersion = '1.1'
     ) {
         if ($this->reasonPhrase === '') {
             $this->reasonPhrase = self::PHRASES[$this->statusCode] ?? 'Unknown';
         }
 
-        $normalizedHeaders = [];
-        foreach ($headers as $name => $value) {
-            $values = [];
-            foreach ((array) $value as $val) {
-                $values[] = (string) $val;
-            }
-            $normalizedHeaders[strtolower($name)] = $values;
-        }
-        $this->headers = $normalizedHeaders;
+        $this->headers = $this->normalizeHeaders($headers);
+        $this->body = $body;
+        $this->protocolVersion = $protocolVersion;
     }
 
     /**
-     * Helper factory to build a plaintext response.
+     * Helper factory to build a plain text response.
      */
     public static function plaintext(string $text, int $status = 200): self
     {
@@ -129,10 +115,7 @@ final class Response
         );
 
         if (! \is_string($json)) {
-            throw new \InvalidArgumentException(
-                'Unable to encode given data as JSON: ' . json_last_error_msg(),
-                json_last_error()
-            );
+            throw new \InvalidArgumentException('Unable to encode given data as JSON: ' . json_last_error_msg());
         }
 
         return new self($status, ['content-type' => 'application/json'], $json . "\n");
@@ -195,103 +178,5 @@ final class Response
     public function getReasonPhrase(): string
     {
         return $this->reasonPhrase;
-    }
-
-    /**
-     * Retrieves the HTTP protocol version (e.g., "1.1", "1.0").
-     *
-     * @return string The HTTP protocol version.
-     */
-    public function getProtocolVersion(): string
-    {
-        return $this->protocolVersion;
-    }
-
-    /**
-     * Retrieves all response headers.
-     *
-     * @return array<string, list<string>> An associative array where keys are lowercase header names,
-     *                                     and values are lists of string values.
-     */
-    public function getHeaders(): array
-    {
-        return $this->headers;
-    }
-
-    /**
-     * Retrieves a specific header as a single, comma-separated string.
-     *
-     * @param string $name The case-insensitive header name.
-     *
-     * @return string A comma-separated string of header values, or an empty string if not present.
-     */
-    public function getHeaderLine(string $name): string
-    {
-        return implode(', ', $this->headers[strtolower($name)] ?? []);
-    }
-
-    /**
-     * Sets or overwrites a specific response header.
-     *
-     * @param string $name The case-insensitive header name.
-     * @param string|list<string> $value The header value or list of values.
-     *
-     * @return void
-     */
-    public function setHeader(string $name, string|array $value): void
-    {
-        $values = [];
-        foreach ((array) $value as $val) {
-            $values[] = (string) $val;
-        }
-        $this->headers[strtolower($name)] = $values;
-    }
-
-    /**
-     * Appends values to an existing response header.
-     *
-     * @param string $name The case-insensitive header name.
-     * @param string|list<string> $value The header value or list of values to append.
-     *
-     * @return void
-     */
-    public function addHeader(string $name, string|array $value): void
-    {
-        $normalizedName = strtolower($name);
-        $values = [];
-        foreach ((array) $value as $val) {
-            $values[] = (string) $val;
-        }
-
-        $this->headers[$normalizedName] = [
-            ...($this->headers[$normalizedName] ?? []),
-            ...$values,
-        ];
-    }
-
-    /**
-     * Retrieves the response body payload.
-     *
-     * Depending on the content type:
-     * - Buffered: Returns the body as a raw string.
-     * - Streaming: Returns a ReadableStreamInterface (for file streams, SSE, etc.).
-     *
-     * @return string|ReadableStreamInterface The response body.
-     */
-    public function getBody(): string|ReadableStreamInterface
-    {
-        return $this->body;
-    }
-
-    /**
-     * Sets or updates the response body payload.
-     *
-     * @param string|ReadableStreamInterface $body The body string or streaming object.
-     *
-     * @return void
-     */
-    public function setBody(string|ReadableStreamInterface $body): void
-    {
-        $this->body = $body;
     }
 }

@@ -345,21 +345,22 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         foreach ($lines as $line) {
             $partsL = explode(':', $line, 2);
             if (\count($partsL) === 2) {
-                $headers[strtolower(trim($partsL[0]))][] = trim($partsL[1]);
-            }
-        }
-
-        $this->isChunked = isset($headers['transfer-encoding']) && strtolower($headers['transfer-encoding'][0]) === 'chunked';
-
-        if (isset($headers['content-length'])) {
-            $this->expectedBodyLength = (int) $headers['content-length'][0];
-            if (! $this->streamingRequests && $this->expectedBodyLength > $this->maxBodySize) {
-                $this->sendErrorAndClose(413, 'Payload Too Large');
+                $headers[trim($partsL[0])][] = trim($partsL[1]);
             }
         }
 
         $serverParams = ['REMOTE_ADDR' => $this->connection->getRemoteAddress()];
+
         $this->currentRequest = new Request($parts[0], $parts[1], $headers, '', substr($parts[2], 5), $serverParams);
+
+        $this->isChunked = $this->currentRequest->getHeaderLine('transfer-encoding') === 'chunked';
+
+        if ($this->currentRequest->hasHeader('content-length')) {
+            $this->expectedBodyLength = (int) $this->currentRequest->getHeaderLine('content-length');
+            if (! $this->streamingRequests && $this->expectedBodyLength > $this->maxBodySize) {
+                $this->sendErrorAndClose(413, 'Payload Too Large');
+            }
+        }
     }
 
     private function sendErrorAndClose(int $statusCode, string $reason): void
