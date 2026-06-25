@@ -70,9 +70,25 @@ describe('HttpServer Configuration & Instantiation', function () {
         ;
     });
 
-    it('throws an exception if cluster mode is requested with less than 2 workers', function () {
-        HttpServer::create()->withCluster(1);
-    })->throws(InvalidConfigurationException::class, 'Cluster mode requires at least 2 workers.');
+    it('configures cluster mode correctly with multiple workers', function () {
+        $server = HttpServer::create()->withCluster(4);
+
+        expect(getServerProperty($server, 'clusterEnabled'))->toBeTrue()
+            ->and(getServerProperty($server, 'workerCount'))->toBe(4)
+        ;
+    });
+
+    it('allows cluster mode with exactly 1 worker for debugging/isolation', function () {
+        $server = HttpServer::create()->withCluster(1);
+
+        expect(getServerProperty($server, 'clusterEnabled'))->toBeTrue()
+            ->and(getServerProperty($server, 'workerCount'))->toBe(1)
+        ;
+    });
+
+    it('throws an exception if cluster mode is requested with 0 workers', function () {
+        HttpServer::create()->withCluster(0);
+    })->throws(InvalidConfigurationException::class, 'Cluster mode requires at least 1 worker.');
 
     it('can disable cluster mode explicitly', function () {
         $server = HttpServer::create()->withCluster(4)->withoutCluster();
@@ -124,7 +140,7 @@ describe('HttpServer Configuration & Instantiation', function () {
         $server = HttpServer::create()->withMaxConnections(150, false);
 
         expect(getServerProperty($server, 'connectionLimit'))->toBe(150)
-            ->and(getServerProperty($server, 'pauseOnLimit'))->toBeFalse();
+            ->and(getServerProperty($server, 'pauseOnLimit'))->toBeFalse()
+        ;
     });
-
 });

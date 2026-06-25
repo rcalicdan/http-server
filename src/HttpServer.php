@@ -134,8 +134,8 @@ final class HttpServer implements HttpServerInterface
      */
     public function withCluster(int $workers): static
     {
-        if ($workers <= 1) {
-            throw new InvalidConfigurationException('Cluster mode requires at least 2 workers.');
+        if ($workers < 1) {
+            throw new InvalidConfigurationException('Cluster mode requires at least 1 worker.');
         }
 
         $clone = clone $this;
@@ -282,7 +282,7 @@ final class HttpServer implements HttpServerInterface
             Loop::stop();
         });
 
-        $this->log("HTTP Server listening on {$this->uri} (Single Process Mode)");
+        $this->log("HTTP Server listening on {$this->getDisplayUri()} (Single Process Mode)");
         Loop::run();
     }
 
@@ -364,7 +364,7 @@ final class HttpServer implements HttpServerInterface
             Loop::stop();
         }));
 
-        $this->log("HTTP Server listening on {$this->uri} (Cluster Mode: {$workers} Workers)");
+        $this->log("HTTP Server listening on {$this->getDisplayUri()} (Cluster Mode: {$workers} Workers)");
         $this->log('Active Worker PIDs: ' . implode(', ', $pids));
 
         Loop::run();
@@ -401,6 +401,13 @@ final class HttpServer implements HttpServerInterface
         }
 
         return $address;
+    }
+
+    private function getDisplayUri(): string
+    {
+        $display = str_replace('tcp://', 'http://', $this->uri);
+
+        return str_replace('tls://', 'https://', $display);
     }
 
     /**
