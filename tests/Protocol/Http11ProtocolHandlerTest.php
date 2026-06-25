@@ -120,8 +120,9 @@ it('rejects and responds with a 413 status code if content-length exceeds max li
     $handler = new Http11ProtocolHandler($connection, function () {
     }, maxBodySize: 10);
 
-    $raw = "POST /upload HTTP/1.1\r\n" .
-        "Content-Length: 100\r\n\r\n";
+    $raw = "POST /upload HTTP/1.1\r\n"
+        . "Host: localhost\r\n"
+        . "Content-Length: 100\r\n\r\n";
 
     $handler->handleData($raw);
 
@@ -135,7 +136,7 @@ it('yields unparsed trailing bytes when detached for websocket/protocol upgrades
     $handler = new Http11ProtocolHandler($connection, function () {
     });
 
-    $handler->handleData("GET /chat HTTP/1.1\r\nUpgrade: websocket\r\n\r\n<ws-binary-frame-data>");
+    $handler->handleData("GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\r\n<ws-binary-frame-data>");
 
     $trailingBytes = $handler->detach();
 
@@ -167,7 +168,8 @@ it('correctly formats and writes response structures to the connection', functio
         ->and($writtenBuffer)->toContain('Content-Type: text/html')
         ->and($writtenBuffer)->toContain('X-Powered-By: PestTests')
         ->and($writtenBuffer)->toContain('Content-Length: 16')
-        ->and($writtenBuffer)->toContain("\r\n\r\n<h1>Success</h1>");
+        ->and($writtenBuffer)->toContain("\r\n\r\n<h1>Success</h1>")
+    ;
 });
 
 it('handles pipelined requests sequentially in a single TCP stream payload', function () {
@@ -181,7 +183,7 @@ it('handles pipelined requests sequentially in a single TCP stream payload', fun
     });
 
     $rawPayload = "GET /first-page HTTP/1.1\r\nHost: localhost\r\n\r\n" .
-                 "POST /second-page HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody";
+        "POST /second-page HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody";
 
     $handler->handleData($rawPayload);
 
@@ -190,7 +192,8 @@ it('handles pipelined requests sequentially in a single TCP stream payload', fun
         ->and($parsedRequests[0]->getUri())->toBe('/first-page')
         ->and($parsedRequests[1]->getMethod())->toBe('POST')
         ->and($parsedRequests[1]->getUri())->toBe('/second-page')
-        ->and($parsedRequests[1]->getBody())->toBe('body');
+        ->and($parsedRequests[1]->getBody())->toBe('body')
+    ;
 });
 
 it('triggers onRequest immediately when streamingRequests is enabled, then pipes the body dynamically', function () {
@@ -205,20 +208,21 @@ it('triggers onRequest immediately when streamingRequests is enabled, then pipes
         $parsedRequest = $request;
     }, streamingRequests: true);
 
-    $handler->handleData("POST /stream-endpoint HTTP/1.1\r\nContent-Length: 10\r\n\r\n");
+    $handler->handleData("POST /stream-endpoint HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n");
 
     expect($parsedRequest)->not->toBeNull()
-        ->and($parsedRequest->getBody())->toBeInstanceOf(RequestBodyStream::class);
+        ->and($parsedRequest->getBody())->toBeInstanceOf(RequestBodyStream::class)
+    ;
 
     $streamedData = '';
     $parsedRequest->getBody()->on('data', function (string $chunk) use (&$streamedData) {
         $streamedData .= $chunk;
     });
 
-    $handler->handleData("hello");
+    $handler->handleData('hello');
     expect($streamedData)->toBe('hello');
 
-    $handler->handleData("world");
+    $handler->handleData('world');
     expect($streamedData)->toBe('helloworld');
 });
 
@@ -233,16 +237,17 @@ it('correctly trims and ignores chunk extensions inside chunked payloads', funct
     });
 
     $raw = "POST /chunked HTTP/1.1\r\n" .
-           "Host: localhost\r\n" .
-           "Transfer-Encoding: chunked\r\n\r\n" .
-           "5;key=value;another=param\r\n" . 
-           "chunk\r\n" .
-           "0\r\n\r\n";
+        "Host: localhost\r\n" .
+        "Transfer-Encoding: chunked\r\n\r\n" .
+        "5;key=value;another=param\r\n" .
+        "chunk\r\n" .
+        "0\r\n\r\n";
 
     $handler->handleData($raw);
 
     expect($parsedRequest)->not->toBeNull()
-        ->and($parsedRequest->getBody())->toBe('chunk');
+        ->and($parsedRequest->getBody())->toBe('chunk')
+    ;
 });
 
 it('responds with 400 Bad Request and terminates when the request line is structurally malformed', function () {
@@ -252,14 +257,17 @@ it('responds with 400 Bad Request and terminates when the request line is struct
     $writtenBuffer = '';
     $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$writtenBuffer) {
         $writtenBuffer .= $data;
+
         return true;
     });
     $connection->shouldReceive('close')->once();
 
-    $handler = new Http11ProtocolHandler($connection, function () {});
+    $handler = new Http11ProtocolHandler($connection, function () {
+    });
 
     $handler->handleData("GET HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
     expect($writtenBuffer)->toContain('HTTP/1.1 400 Bad Request')
-        ->and($writtenBuffer)->toContain('Connection: close');
+        ->and($writtenBuffer)->toContain('Connection: close')
+    ;
 });

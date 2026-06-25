@@ -72,24 +72,39 @@ abstract class AbstractMessage
 
     /**
      * Sets or overwrites a specific header.
+     *
+     * @param string $name
+     * @param string|array<array-key, string|numeric> $value
+     *
+     * @return void
      */
     public function setHeader(string $name, string|array $value): void
     {
         $values = [];
-        foreach ((array) $value as $val) {
+        $iterable = \is_array($value) ? $value : [$value];
+
+        foreach ($iterable as $val) {
             $values[] = (string) $val;
         }
+
         $this->headers[strtolower($name)] = $values;
     }
 
     /**
      * Appends values to an existing header.
+     *
+     * @param string $name
+     * @param string|array<array-key, string|numeric> $value
+     *
+     * @return void
      */
     public function addHeader(string $name, string|array $value): void
     {
         $normalizedName = strtolower($name);
         $values = [];
-        foreach ((array) $value as $val) {
+        $iterable = \is_array($value) ? $value : [$value];
+
+        foreach ($iterable as $val) {
             $values[] = (string) $val;
         }
 

@@ -50,6 +50,8 @@ final class Request extends AbstractMessage
 
     /**
      * Retrieves server-side environment parameters.
+     *
+     * @return array<string, mixed>
      */
     public function getServerParams(): array
     {
