@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Hibla\HttpServer\Interfaces;
 
+use Hibla\HttpServer\Message\Response;
 use Hibla\Socket\Interfaces\ConnectionInterface;
 
 interface ProtocolHandlerInterface
@@ -16,7 +17,7 @@ interface ProtocolHandlerInterface
     /**
      * Send a response back to the client.
      */
-    public function writeResponse(ResponseInterface $response): void;
+    public function writeResponse(Response $response): void;
 
     /**
      * Get the underlying raw TCP/TLS connection.

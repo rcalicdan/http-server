@@ -5,9 +5,8 @@ declare(strict_types=1);
 namespace Hibla\HttpServer\Protocol;
 
 use Hibla\HttpServer\Interfaces\ProtocolHandlerInterface;
-use Hibla\HttpServer\Interfaces\RequestInterface;
-use Hibla\HttpServer\Interfaces\ResponseInterface;
 use Hibla\HttpServer\Message\Request;
+use Hibla\HttpServer\Message\Response;
 use Hibla\HttpServer\Message\RequestBodyStream;
 use Hibla\Socket\Interfaces\ConnectionInterface;
 
@@ -43,7 +42,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     /**
      * @param ConnectionInterface $connection The raw TCP/TLS connection
-     * @param callable(RequestInterface, ProtocolHandlerInterface): void $onRequest Callback triggered when a full request is parsed
+     * @param callable(Request, ProtocolHandlerInterface): void $onRequest Callback triggered when a full request is parsed
      * @param int $maxBodySize Limit for request body buffering in bytes (Default: 10MB)
      * @param bool $streamingRequests True to enable streaming request bodies
      */
@@ -55,11 +54,17 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     ) {
     }
 
+    /**
+     * @inheritDoc
+     */
     public function getConnection(): ConnectionInterface
     {
         return $this->connection;
     }
 
+    /**
+     * @inheritDoc
+     */
     public function handleData(string $data): void
     {
         if ($this->state === self::STATE_UPGRADED) {
@@ -95,7 +100,10 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         }
     }
 
-    public function writeResponse(ResponseInterface $response): void
+    /**
+     * @inheritDoc
+     */
+    public function writeResponse(Response $response): void
     {
         $body = $response->getBody();
         $isStreamingOut = ! \is_string($body);
@@ -158,6 +166,9 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         }
     }
 
+    /**
+     * @inheritDoc
+     */
     public function detach(): string
     {
         $this->state = self::STATE_UPGRADED;

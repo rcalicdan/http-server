@@ -7,9 +7,8 @@ namespace Hibla\HttpServer;
 use Hibla\EventLoop\Loop;
 use Hibla\HttpServer\Interfaces\HttpServerInterface;
 use Hibla\HttpServer\Interfaces\ProtocolHandlerInterface;
-use Hibla\HttpServer\Interfaces\RequestInterface;
-use Hibla\HttpServer\Interfaces\ResponseInterface;
 use Hibla\HttpServer\Internals\ServerWorkerTask;
+use Hibla\HttpServer\Message\Request;
 use Hibla\HttpServer\Message\Response;
 use Hibla\HttpServer\Protocol\Http11ProtocolHandler;
 use Hibla\Parallel\Parallel;
@@ -386,12 +385,12 @@ final class HttpServer implements HttpServerInterface
         bool $streamingRequests = false
     ): void {
         $socket->on('connection', static function (ConnectionInterface $connection) use ($requestHandler, $maxBodySize, $streamingRequests) {
-            $protocolHandler = new Http11ProtocolHandler($connection, function (RequestInterface $request, ProtocolHandlerInterface $protocol) use ($requestHandler) {
+            $protocolHandler = new Http11ProtocolHandler($connection, function (Request $request, ProtocolHandlerInterface $protocol) use ($requestHandler) {
                 $fiber = new \Fiber(function () use ($requestHandler, $request, $protocol) {
                     try {
                         $response = $requestHandler($request);
-                        if (! $response instanceof ResponseInterface) {
-                            throw new \LogicException('Request handler must return an instance of ResponseInterface');
+                        if (! $response instanceof Response) {
+                            throw new \LogicException('Request handler must return an instance of Response');
                         }
                         $protocol->writeResponse($response);
                     } catch (\Throwable $e) {
