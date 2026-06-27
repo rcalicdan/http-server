@@ -33,6 +33,8 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     private const int MAX_CHUNK_LINE_SIZE = 1024;
 
+    private const int MAX_STREAMING_CHUNK_SIZE = 16777216;
+
     private bool $isChunked = false;
 
     private bool $willCloseConnection = false;
@@ -75,7 +77,13 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     /**
      * @param ConnectionInterface $connection The raw TCP/TLS connection
      * @param callable(Request, ProtocolHandlerInterface): void $onRequest Callback triggered when a full request is parsed
-     * @param int $maxBodySize Limit for request body buffering in bytes (Default: 10MB)
+     * @param int $maxBodySize Maximum body size in bytes for buffered (non-streaming) requests.
+     *                         In buffered mode this governs both the per-chunk cap (chunked TE)
+     *                         and the total accumulated body limit. In streaming mode neither
+     *                         limit applies so the application layer controls consumption and
+     *                         back-pressure via the RequestBodyStream pause/resume interface.
+     *                         Individual chunk sizes in streaming mode are independently capped
+     *                         at MAX_STREAMING_CHUNK_SIZE as a memory safety bound.
      * @param bool $streamingRequests True to enable streaming request bodies
      */
     public function __construct(
@@ -145,7 +153,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
      *
      * @param Response $response
      *
-     * @return void
+     * @inheritDoc
      */
     public function writeResponse(Response $response): void
     {
@@ -407,6 +415,9 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             return false;
         }
 
+        //hex strings >= 16 digits exceed PHP_INT_MAX on 64-bit systems.
+        // hexdec() silently returns a float; (int) cast produces platform-dependent
+        // garbage (typically -1 or PHP_INT_MIN) that corrupts the chunk-data read path.
         if (\strlen($hex) > 15) {
             $this->sendErrorAndClose(400, 'Bad Request');
 
@@ -421,7 +432,22 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             return $this->parseChunkTrailerPhase();
         }
 
-        if ($this->currentChunkSize > $this->maxBodySize) {
+        // Enforce a per-chunk size cap before entering STATE_CHUNK_DATA.
+        // Without this, a client that declares a chunk larger than the cap and then
+        // dribbles data holds the connection open while the buffer grows unbounded and
+        // parseChunkDataPhase() waits for the full declared size and pushBodyData()'s
+        // accumulated-size check is never reached.
+        //
+        // The cap differs by mode because maxBodySize means different things:
+        //   - Buffered mode: maxBodySize is both the per-chunk and total body limit.
+        //   - Streaming mode: maxBodySize is intentionally not enforced as a body limit
+        //     (the application layer owns that policy via back-pressure). A separate
+        //     constant caps individual chunk sizes purely as a memory safety bound.
+        $chunkSizeLimit = $this->streamingRequests
+            ? self::MAX_STREAMING_CHUNK_SIZE
+            : $this->maxBodySize;
+
+        if ($this->currentChunkSize > $chunkSizeLimit) {
             $this->sendErrorAndClose(413, 'Payload Too Large');
 
             return false;
@@ -524,7 +550,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     private function finalizeRequest(): void
     {
-        if ($this->currentRequest === null || $this->state === self::STATE_UPGRADED) {
+        if ($this->currentRequest === null) {
             return;
         }
 
@@ -538,9 +564,6 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             }
         }
 
-        // The onRequest callback may have called writeResponse() with Connection: close,
-        // which sets STATE_UPGRADED. Do not clobber that and let the UPGRADED state stand
-        // so the buffer loop exits and the smuggled bytes are never parsed.
         if ($this->state !== self::STATE_UPGRADED) {
             $this->state = self::STATE_HEADERS;
         }
@@ -603,7 +626,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         $target = substr($requestLine, $s1 + 1, $s2 - $s1 - 1);
         $version = substr($requestLine, $s2 + 1);
 
-        if (preg_match('/[\x00-\x1F\x7F]/', $method)) {
+        if (preg_match('/[\x00-\x1F\x7F]/', $method) === 1) {
             throw new MessageParsingException('Invalid control character in request method');
         }
 
@@ -624,10 +647,9 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         while ($offset < $headerBodyLen) {
             $nextCrLf = strpos($headerBody, "\r\n", $offset);
 
-            // Fast loop fallback: If no further CRLF is found, process the final header line.
             if ($nextCrLf === false) {
                 $line = substr($headerBody, $offset);
-                $offset = $headerBodyLen; // Triggers loop exit on next iteration.
+                $offset = $headerBodyLen;
             } else {
                 $line = substr($headerBody, $offset, $nextCrLf - $offset);
                 $offset = $nextCrLf + 2;
@@ -658,7 +680,18 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                 throw new MessageParsingException("Whitespace before colon is not permitted in field name: \"{$rawFieldName}\"");
             }
 
-            if (preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $fieldValue)) {
+            // RFC 9110 section 5.1: field names must conform to the token rule that is a visible ASCII.
+            // Only (0x21–0x7E), excluding the delimiter set: ( ) < > @ , ; : \ " / [ ] ? = { }
+            // The colon is structurally impossible here (extracted via strpos), but included
+            // in the pattern for completeness. The whitespace check above already catches
+            // trailing SP/HT, but the token rule is broader so null bytes, other controls,
+            // and delimiter chars must also be rejected to prevent proxy differential attacks
+            // where a front-end normalizes a malformed name that this parser silently accepted.
+            if ($rawFieldName === '' || preg_match('/[^\x21-\x7E]|[()<>@,;:\\\\"\/\[\]?={}]/', $rawFieldName) === 1) {
+                throw new MessageParsingException("Invalid characters in field name: \"{$rawFieldName}\"");
+            }
+
+            if (preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $fieldValue) === 1) {
                 throw new MessageParsingException("Invalid control character in header field value for: \"{$rawFieldName}\"");
             }
 
@@ -720,7 +753,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
             // Note: The parser intentionally do NOT validate intermediate codings here.
             // Intermediaries or the application layer MAY process compressed codings
-            // (e.g. gzip, chunked) internally. We only care that framing terminates in 'chunked'.
+            // (e.g. gzip, chunked) internally. It only care that framing terminates in 'chunked'.
 
             $this->isChunked = true;
 
