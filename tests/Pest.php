@@ -30,3 +30,20 @@ function mockConnection(string &$buffer, bool $expectClose = false): ConnectionI
 
     return $connection;
 }
+
+function mockStreamingConnection(string &$buffer): ConnectionInterface
+{
+    $connection = Mockery::mock(ConnectionInterface::class);
+    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
+
+    $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$buffer) {
+        $buffer .= $data;
+
+        return true;
+    });
+
+    $connection->shouldReceive('pause')->zeroOrMoreTimes();
+    $connection->shouldReceive('resume')->zeroOrMoreTimes();
+
+    return $connection;
+}

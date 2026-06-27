@@ -47,6 +47,8 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     private int $currentChunkSize = 0;
 
+    private int $chunkBytesRead = 0;
+
     private int $bufferOffset = 0;
 
     private int $bufferedBodyBytes = 0;
@@ -464,6 +466,39 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     private function parseChunkDataPhase(): bool
     {
         $available = \strlen($this->buffer) - $this->bufferOffset;
+
+        if ($available === 0) {
+            return false;
+        }
+
+        if ($this->streamingRequests) {
+            $remaining = $this->currentChunkSize - $this->chunkBytesRead;
+            $canRead = min($remaining, $available);
+
+            if ($canRead > 0) {
+                $chunk = substr($this->buffer, $this->bufferOffset, $canRead);
+                $this->bufferOffset += $canRead;
+                $this->chunkBytesRead += $canRead;
+
+                if (! $this->pushBodyData($chunk)) {
+                    return false;
+                }
+            }
+
+            if ($this->chunkBytesRead >= $this->currentChunkSize) {
+                if (\strlen($this->buffer) - $this->bufferOffset < 2) {
+                    return false;
+                }
+
+                $this->bufferOffset += 2;
+                $this->chunkBytesRead = 0;
+                $this->state = self::STATE_CHUNK_SIZE;
+
+                return true;
+            }
+
+            return false;
+        }
 
         if ($available >= $this->currentChunkSize + 2) {
             $chunk = substr($this->buffer, $this->bufferOffset, $this->currentChunkSize);
