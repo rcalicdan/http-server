@@ -13,6 +13,69 @@ use Hibla\HttpServer\Message\RequestBodyStream;
 use Hibla\HttpServer\Message\Response;
 use Hibla\Socket\Interfaces\ConnectionInterface;
 
+/**
+ * HTTP/1.1 protocol handler responsible for parsing inbound TCP streams into
+ * structured Request objects and serializing Response objects back onto the wire.
+ *
+ * This class operates as a state machine driven by raw TCP read events. Each call
+ * to handleData() advances the machine through one or more of the following phases:
+ *
+ *   STATE_HEADERS       → Accumulate and parse the request-line and header fields.
+ *   STATE_BODY_LENGTH   → Read a fixed-length body declared via Content-Length.
+ *   STATE_CHUNK_SIZE    → Read the hex size line of the next chunked segment.
+ *   STATE_CHUNK_DATA    → Read the chunk payload up to the declared size.
+ *   STATE_CHUNK_TRAILER → Consume the optional trailer section after the terminal chunk.
+ *   STATE_UPGRADED      → Connection has been handed off or closed; all input is discarded.
+ *
+ * ─── Message Framing ─────────────────────────────────────────────────────────────
+ *
+ * Parses the request-line and header fields. Enforces the token rule on field names,
+ * rejects obs-fold (obsolete line folding), bare CRs, and non-conforming version strings.
+ * Validates the Transfer-Encoding chain — chunked MUST be the final coding and MUST NOT
+ * appear more than once; a duplicate chunked earlier in the chain is the TE.TE
+ * request-smuggling vector. Content-Length is validated as a string of unsigned decimal
+ * digits; conflicting values produce a 400 Bad Request. Implements chunked transfer
+ * decoding with chunk extensions stripped and discarded. Response status-lines mirror
+ * the protocol version of the originating request; HTTP/1.0 connections are
+ * non-persistent by default.
+ *
+ * ─── HTTP Semantics ──────────────────────────────────────────────────────────────
+ *
+ * Enforces the token rule on both request method and header field names, blocking
+ * proxy-differential attacks where a lenient upstream normalises a malformed field.
+ * Validates the Host header on HTTP/1.1 requests: MUST be present, singular, and not
+ * a comma-separated list. PHP's numeric cast is intentionally avoided for Content-Length
+ * to prevent silent coercion of values such as "10abc" or "-5" that would desync this
+ * server's body boundary from any upstream proxy. Responds with 100 Continue when the
+ * request carries an Expect: 100-continue field and the header block has been accepted.
+ *
+ * ─── CONNECT Tunnelling ──────────────────────────────────────────────────────────
+ *
+ * A rejected CONNECT request (4xx/5xx) forces connection closure to prevent
+ * optimistically-pipelined bytes from being misinterpreted as a new HTTP request.
+ * The state machine advances to STATE_UPGRADED immediately after the response is
+ * flushed, causing all subsequent inbound data to be silently discarded.
+ *
+ * ─── Security Hardening ──────────────────────────────────────────────────────────
+ *
+ * - MAX_HEADER_SIZE (8 KiB) caps header block accumulation to prevent memory
+ *   exhaustion from clients that never send the "\r\n\r\n" terminator (→ 431).
+ * - MAX_CHUNK_LINE_SIZE (1 KiB) prevents unbounded buffer growth when a client
+ *   streams a chunk-size line without a terminating CRLF (→ 400).
+ * - Hex chunk sizes are rejected when they exceed 15 digits; beyond that hexdec()
+ *   silently returns a float whose (int) cast is platform-dependent and could
+ *   produce a negative chunk size, corrupting the read path entirely.
+ * - In streaming mode individual chunk sizes are capped at MAX_STREAMING_CHUNK_SIZE
+ *   (16 MiB) as a memory-safety bound independent of application-layer back-pressure.
+ * - Per-process header name formatting is memoised in $headerNameCache to avoid
+ *   repeated ucwords/str_replace allocations for the same field name across every
+ *   response in the process lifetime. The cache is bounded at MAX_HEADER_CACHE_SIZE
+ *   entries and reset when the limit is exceeded to prevent unbounded growth.
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc9110
+ * @see https://www.rfc-editor.org/rfc/rfc9112
+ * @see https://www.rfc-editor.org/rfc/rfc9931
+ */
 class Http11ProtocolHandler implements ProtocolHandlerInterface
 {
     private const int STATE_HEADERS = 0;
@@ -629,6 +692,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
      * - section 6.1: Enforces mandatory connection closure if both Transfer-Encoding and Content-Length are present.
      * - section 6.3: Validates TE chains. 400 Bad Request if recognized but not chunked-terminated, 501 if unrecognized.
      * - section 6.3: Removes Content-Length entirely if Transfer-Encoding is present.
+     * - section 4:   chunked MUST appear exactly once and MUST be the final coding (TE.TE smuggling prevention).
      *
      * @param string $rawHeaders The raw HTTP header string including the request line.
      *
@@ -661,8 +725,8 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         $target = substr($requestLine, $s1 + 1, $s2 - $s1 - 1);
         $version = substr($requestLine, $s2 + 1);
 
-        if (preg_match('/[\x00-\x1F\x7F]/', $method) === 1) {
-            throw new MessageParsingException('Invalid control character in request method');
+        if ($method === '' || preg_match('/[^\x21-\x7E]|[()<>@,;:\\\\"\/\[\]?={}]/', $method) === 1) {
+            throw new MessageParsingException('Invalid characters in request method');
         }
 
         if (
@@ -775,6 +839,16 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             }
 
             $lastCoding = end($codings);
+
+            // RFC 9112 section 6.1: chunked MUST appear exactly once and MUST be the final coding.
+            // A duplicated chunked anywhere earlier in the chain is the TE.TE smuggling vector —
+            // different hops process different occurrences and disagree on where the body ends.
+            $intermediateCodings = \array_slice($codings, 0, -1);
+            if (\in_array('chunked', $intermediateCodings, true)) {
+                throw new MessageParsingException(
+                    'chunked transfer-encoding must appear only as the final coding'
+                );
+            }
 
             if ($lastCoding !== 'chunked') {
                 $knownCodings = ['chunked', 'compress', 'deflate', 'gzip', 'x-compress', 'x-gzip'];
