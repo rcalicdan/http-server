@@ -224,12 +224,7 @@ final class HttpServer implements HttpServerInterface
     }
 
     /**
-     * Configure the maximum allowed size and count for HTTP headers.
-     *
-     * @param int $maxSize Maximum total header block size in bytes (Default: 8192).
-     * @param int $maxCount Maximum number of header fields allowed (Default: 100).
-     *
-     * @return static A new instance with header limits configured.
+     * {@inheritdoc}
      */
     public function withHeaderLimits(int $maxSize, int $maxCount): static
     {
@@ -240,6 +235,9 @@ final class HttpServer implements HttpServerInterface
         return $clone;
     }
 
+    /**
+     * {@inheritdoc}
+     */
     public function withMaxConnections(int $limit, bool $pauseOnLimit = true): static
     {
         $clone = clone $this;
