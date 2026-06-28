@@ -396,24 +396,24 @@ describe('Protocol Compliance & Advanced Features', function () {
         }
     });
 
-    it('protects against HTTP Response Splitting (CRLF Injection) in outbound headers', function () {
+  it('protects against HTTP Response Splitting (CRLF Injection) in outbound headers', function () {
         [$socket, $url] = createTestServer(function (ServerRequest $request) {
             return new ServerResponse(200, [
-                'X-Injected-Header' => "value\r\nMalicious-Header: evil\r\nAnother-Header: values",
+                'X-Injected-Header' => "value\r\nMalicious-Header: evil"
             ], 'Response OK');
         });
 
         try {
             $rawClient = new Connector();
             $connection = await($rawClient->connect(str_replace('http://', 'tcp://', $url)));
-
+            
             $connection->write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
             $responsePromise = new Promise(function ($resolve) use ($connection) {
                 $buffer = '';
                 $connection->on('data', function ($chunk) use (&$buffer, $resolve, $connection) {
                     $buffer .= $chunk;
-                    if (str_contains($buffer, 'Response OK')) {
+                    if (str_contains($buffer, "\r\n\r\n")) {
                         $resolve($buffer);
                         $connection->close();
                     }
@@ -422,9 +422,8 @@ describe('Protocol Compliance & Advanced Features', function () {
 
             $rawResponse = await($responsePromise);
 
-            expect($rawResponse)->not->toContain('Malicious-Header: evil')
-                ->and($rawResponse)->toContain('X-Injected-Header: valueMalicious-Header: evilAnother-Header: values')
-            ;
+            expect($rawResponse)->toContain('HTTP/1.1 500 Internal Server Error')
+                ->and($rawResponse)->toContain('invalid control characters');
         } finally {
             $socket->close();
         }

@@ -279,7 +279,17 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         foreach ($headers as $name => $values) {
             $displayName = self::formatHeaderNameForWire($name);
             foreach ((array) $values as $value) {
-                $lines[] = "{$displayName}: {$value}";
+                $strValue = (string) $value;
+
+                // SECURITY BOUNDARY: Throw if the application outputs unsafe control characters.
+                // Prevents HTTP Response Splitting and Alerts the developer.
+                if (preg_match('/[\r\n\0]/', $strValue) === 1) {
+                    throw new \Hibla\HttpServer\Exceptions\InvalidResponseException(
+                        "Header value for '{$name}' contains invalid control characters (CR, LF, or NUL)"
+                    );
+                }
+
+                $lines[] = "{$displayName}: {$strValue}";
             }
         }
 
