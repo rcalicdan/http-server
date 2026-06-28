@@ -117,6 +117,16 @@ interface HttpServerInterface
     public function withMaxConnections(int $limit, bool $pauseOnLimit = true): static;
 
     /**
+     * Configure the maximum allowed size and count for HTTP headers.
+     *
+     * @param int $maxSize Maximum total header block size in bytes (Default: 8192).
+     * @param int $maxCount Maximum number of header fields allowed (Default: 100).
+     *
+     * @return static A new instance with header limits configured.
+     */
+    public function withHeaderLimits(int $maxSize, int $maxCount): static;
+
+    /**
      * Start the HTTP Server and block the current thread to process incoming requests.
      *
      * @param callable $requestHandler Callback invoked for each incoming request.

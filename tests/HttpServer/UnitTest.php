@@ -127,6 +127,14 @@ describe('HttpServer Configuration & Instantiation', function () {
         expect(getServerProperty($server2, 'streamingRequests'))->toBeFalse();
     });
 
+    it('can configure header limits for size and count', function () {
+        $server = HttpServer::create()->withHeaderLimits(16384, 150);
+
+        expect(getServerProperty($server, 'maxHeaderSize'))->toBe(16384)
+            ->and(getServerProperty($server, 'maxHeaderCount'))->toBe(150)
+        ;
+    });
+
     it('can inject a custom socket server', function () {
         $mockSocket = Mockery::mock(ServerInterface::class);
         $server = HttpServer::create()->withSocketServer($mockSocket);

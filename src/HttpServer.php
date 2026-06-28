@@ -68,6 +68,16 @@ final class HttpServer implements HttpServerInterface
     private bool $streamingRequests = false;
 
     /**
+     * @var int Maximum total header block size in bytes (Default: 8192)
+     */
+    private int $maxHeaderSize = 8192;
+
+    /**
+     * @var int Maximum number of header fields allowed (Default: 100)
+     */
+    private int $maxHeaderCount = 100;
+
+    /**
      * @var array<string, mixed> Socket context options
      */
     private array $context = [];
@@ -213,6 +223,21 @@ final class HttpServer implements HttpServerInterface
         return $clone;
     }
 
+    /**
+     * {@inheritdoc}
+     */
+    public function withHeaderLimits(int $maxSize, int $maxCount): static
+    {
+        $clone = clone $this;
+        $clone->maxHeaderSize = $maxSize;
+        $clone->maxHeaderCount = $maxCount;
+
+        return $clone;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
     public function withMaxConnections(int $limit, bool $pauseOnLimit = true): static
     {
         $clone = clone $this;
@@ -249,7 +274,14 @@ final class HttpServer implements HttpServerInterface
             return;
         }
 
-        self::attachProtocolHandler($this->customSocketServer, $requestHandler, $this->maxBodySize, $this->streamingRequests);
+        self::attachProtocolHandler(
+            $this->customSocketServer,
+            $requestHandler,
+            $this->maxBodySize,
+            $this->streamingRequests,
+            $this->maxHeaderSize,
+            $this->maxHeaderCount
+        );
 
         $this->setupSignalHandlers(function () {
             if ($this->customSocketServer !== null) {
@@ -274,7 +306,14 @@ final class HttpServer implements HttpServerInterface
             );
         }
 
-        self::attachProtocolHandler($socket, $requestHandler, $this->maxBodySize, $this->streamingRequests);
+        self::attachProtocolHandler(
+            $socket,
+            $requestHandler,
+            $this->maxBodySize,
+            $this->streamingRequests,
+            $this->maxHeaderSize,
+            $this->maxHeaderCount
+        );
 
         $this->setupSignalHandlers(function () use ($socket) {
             $this->log("\nStopping HTTP Server (Single Process Mode)...");
@@ -306,7 +345,9 @@ final class HttpServer implements HttpServerInterface
             $this->maxBodySize,
             $this->streamingRequests,
             $this->connectionLimit,
-            $this->pauseOnLimit
+            $this->pauseOnLimit,
+            $this->maxHeaderSize,
+            $this->maxHeaderCount
         );
 
         $isShuttingDown = false;
@@ -417,9 +458,11 @@ final class HttpServer implements HttpServerInterface
         ServerInterface $socket,
         callable $requestHandler,
         int $maxBodySize = 10485760,
-        bool $streamingRequests = false
+        bool $streamingRequests = false,
+        int $maxHeaderSize = 8192,
+        int $maxHeaderCount = 100
     ): void {
-        $socket->on('connection', static function (ConnectionInterface $connection) use ($requestHandler, $maxBodySize, $streamingRequests) {
+        $socket->on('connection', static function (ConnectionInterface $connection) use ($requestHandler, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount) {
             $protocolHandler = new Http11ProtocolHandler($connection, function (Request $request, ProtocolHandlerInterface $protocol) use ($requestHandler) {
                 $fiber = new \Fiber(function () use ($requestHandler, $request, $protocol) {
                     try {
@@ -439,7 +482,7 @@ final class HttpServer implements HttpServerInterface
                     }
                 });
                 Loop::addFiber($fiber);
-            }, $maxBodySize, $streamingRequests);
+            }, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount);
 
             $connection->on('data', static function (string $data) use ($protocolHandler) {
                 $protocolHandler->handleData($data);

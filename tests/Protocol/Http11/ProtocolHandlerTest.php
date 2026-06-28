@@ -271,3 +271,38 @@ it('responds with 400 Bad Request and terminates when the request line is struct
         ->and($writtenBuffer)->toContain('Connection: close')
     ;
 });
+
+it('automatically sends a 100 Continue response when the Expect header is present', function () {
+    $connection = Mockery::mock(ConnectionInterface::class);
+    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
+
+    $writtenBuffer = '';
+    $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$writtenBuffer) {
+        $writtenBuffer .= $data;
+
+        return true;
+    });
+
+    /** @var Request|null $parsedRequest */
+    $parsedRequest = null;
+    $handler = new Http11ProtocolHandler($connection, function (Request $request) use (&$parsedRequest) {
+        $parsedRequest = $request;
+    });
+
+    $rawHeaders = "POST /upload HTTP/1.1\r\n" .
+        "Host: localhost\r\n" .
+        "Content-Length: 11\r\n" .
+        "Expect: 100-continue\r\n\r\n";
+
+    $handler->handleData($rawHeaders);
+
+    expect($writtenBuffer)->toBe("HTTP/1.1 100 Continue\r\n\r\n")
+        ->and($parsedRequest)->toBeNull()
+    ;
+
+    $handler->handleData('hello world');
+
+    expect($parsedRequest)->not->toBeNull()
+        ->and($parsedRequest->getBody())->toBe('hello world')
+    ;
+});

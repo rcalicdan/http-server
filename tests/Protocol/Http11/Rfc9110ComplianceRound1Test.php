@@ -8,37 +8,6 @@ use Hibla\HttpServer\Message\Response;
 use Hibla\HttpServer\Protocol\Http11ProtocolHandler;
 use Hibla\Socket\Interfaces\ConnectionInterface;
 
-/**
- * RFC 9112 Compliance Baseline Tests
- *
- * These tests are intentionally written to FAIL against the current implementation.
- * They serve as a precise, executable specification of the conformance gaps
- * identified in the RFC 9112 audit. Fix the implementation, not the tests.
- *
- * Each describe() block maps to the RFC 9112 section that defines the requirement.
- *
- * @see https://www.rfc-editor.org/rfc/rfc9112
- */
-
-function mockConnection(string &$buffer, bool $expectClose = false): ConnectionInterface
-{
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
-    $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$buffer) {
-        $buffer .= $data;
-
-        return true;
-    });
-
-    if ($expectClose) {
-        $connection->shouldReceive('close')->once();
-    } else {
-        $connection->shouldReceive('close')->zeroOrMoreTimes();
-    }
-
-    return $connection;
-}
-
 describe('RFC 9112 section 2.2 — Message Parsing Robustness', function () {
 
     it('tolerates at least one leading CRLF before the request-line', function () {

@@ -6,12 +6,87 @@ namespace Hibla\HttpServer\Protocol;
 
 use Hibla\HttpServer\Exceptions\MessageParsingException;
 use Hibla\HttpServer\Exceptions\PayloadTooLargeException;
+use Hibla\HttpServer\Exceptions\RequestHeaderFieldsTooLargeException;
+use Hibla\HttpServer\Exceptions\UnsupportedTransferCodingException;
 use Hibla\HttpServer\Interfaces\ProtocolHandlerInterface;
 use Hibla\HttpServer\Message\Request;
 use Hibla\HttpServer\Message\RequestBodyStream;
 use Hibla\HttpServer\Message\Response;
 use Hibla\Socket\Interfaces\ConnectionInterface;
 
+/**
+ * HTTP/1.1 protocol handler responsible for parsing inbound TCP streams into
+ * structured Request objects and serializing Response objects back onto the wire.
+ *
+ * This class operates as a state machine driven by raw TCP read events. Each call
+ * to handleData() advances the machine through one or more of the following phases:
+ *
+ *   STATE_HEADERS       → Accumulate and parse the request-line and header fields.
+ *   STATE_BODY_LENGTH   → Read a fixed-length body declared via Content-Length.
+ *   STATE_CHUNK_SIZE    → Read the hex size line of the next chunked segment.
+ *   STATE_CHUNK_DATA    → Read the chunk payload up to the declared size.
+ *   STATE_CHUNK_TRAILER → Consume the optional trailer section after the terminal chunk.
+ *   STATE_UPGRADED      → Connection has been handed off or closed; all input is discarded.
+ *
+ * ─── Message Framing ─────────────────────────────────────────────────────────────
+ *
+ * Parses the request-line and header fields. Enforces the token rule on field names,
+ * rejects obs-fold (obsolete line folding), bare CRs, and non-conforming version strings.
+ * Validates the Transfer-Encoding chain so chunked MUST be the final coding and MUST NOT
+ * appear more than once; a duplicate chunked earlier in the chain is the TE.TE
+ * request-smuggling vector. Content-Length is validated as a string of unsigned decimal
+ * digits; conflicting values produce a 400 Bad Request. Implements chunked transfer
+ * decoding with chunk extensions stripped and discarded. Response status-lines mirror
+ * the protocol version of the originating request; HTTP/1.0 connections are
+ * non-persistent by default.
+ *
+ * ─── HTTP Semantics ──────────────────────────────────────────────────────────────
+ *
+ * Enforces the token rule on both request method and header field names, blocking
+ * proxy-differential attacks where a lenient upstream normalises a malformed field.
+ * Validates the Host header on HTTP/1.1 requests: MUST be present, singular, and not
+ * a comma-separated list. PHP's numeric cast is intentionally avoided for Content-Length
+ * to prevent silent coercion of values such as "10abc" or "-5" that would desync this
+ * server's body boundary from any upstream proxy. Responds with 100 Continue when the
+ * request carries an Expect: 100-continue field and the header block has been accepted.
+ *
+ * ─── CONNECT Tunnelling ──────────────────────────────────────────────────────────
+ *
+ * A rejected CONNECT request (4xx/5xx) forces connection closure to prevent
+ * optimistically-pipelined bytes from being misinterpreted as a new HTTP request.
+ * The state machine advances to STATE_UPGRADED immediately after the response is
+ * flushed, causing all subsequent inbound data to be silently discarded.
+ *
+ * ─── Security Hardening ──────────────────────────────────────────────────────────
+ *
+ * - maxHeaderSize (default 8 KiB) caps header block accumulation to prevent memory
+ *   exhaustion from clients that never send the "\r\n\r\n" terminator (→ 431).
+ *
+ * - maxHeaderCount (default 100) caps the number of headers to prevent loop/CPU
+ *   exhaustion and array/cache bloat.
+ *
+ * - MAX_HEADER_NAME_LENGTH (256 bytes) stops excessively long header field names
+ *   from hitting expensive VCHAR regex validations.
+ *
+ * - MAX_CHUNK_LINE_SIZE (1 KiB) prevents unbounded buffer growth when a client
+ *   streams a chunk-size line without a terminating CRLF (→ 400).
+ *
+ * - Hex chunk sizes are rejected when they exceed 15 digits; beyond that hexdec()
+ *   silently returns a float whose (int) cast is platform-dependent and could
+ *   produce a negative chunk size, corrupting the read path entirely.
+ *
+ * - In streaming mode individual chunk sizes are capped at MAX_STREAMING_CHUNK_SIZE
+ *   (16 MiB) as a memory-safety bound independent of application-layer back-pressure.
+ *
+ * - Per-process header name formatting is memoised in $headerNameCache to avoid
+ *   repeated ucwords/str_replace allocations for the same field name across every
+ *   response in the process lifetime. The cache is bounded at MAX_HEADER_CACHE_SIZE
+ *   entries and reset when the limit is exceeded to prevent unbounded growth.
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc9110
+ * @see https://www.rfc-editor.org/rfc/rfc9112
+ * @see https://www.rfc-editor.org/rfc/rfc9931
+ */
 class Http11ProtocolHandler implements ProtocolHandlerInterface
 {
     private const int STATE_HEADERS = 0;
@@ -24,16 +99,19 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     private const int STATE_UPGRADED = 4;
 
-    /**
-     * Dedicated state for consuming the chunked trailer section (RFC 9112 section 7.1.2).
-     */
     private const int STATE_CHUNK_TRAILER = 5;
 
-    private const int MAX_HEADER_SIZE = 8192;
+    private const int MAX_HEADER_CACHE_SIZE = 512;
 
-    private string $buffer = '';
+    private const int MAX_HEADER_NAME_LENGTH = 256;
+
+    private const int MAX_CHUNK_LINE_SIZE = 1024;
+
+    private const int MAX_STREAMING_CHUNK_SIZE = 16777216;
 
     private bool $isChunked = false;
+
+    private bool $willCloseConnection = false;
 
     private int $state = self::STATE_HEADERS;
 
@@ -43,27 +121,57 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     private int $currentChunkSize = 0;
 
+    private int $chunkBytesRead = 0;
+
+    private int $bufferOffset = 0;
+
+    private int $bufferedBodyBytes = 0;
+
     private ?Request $currentRequest = null;
 
     private ?RequestBodyStream $bodyStream = null;
 
-    private bool $willCloseConnection = false;
-
     private string $activeResponseVersion = '1.1';
+
+    private string $buffer = '';
+
+    /**
+     * @var list<string>
+     */
+    private array $bodyChunks = [];
+
+    /**
+     * Per-process cache mapping lowercase wire-format header names (e.g. "content-type")
+     * to their display-formatted equivalents (e.g. "Content-Type"). Populated lazily on
+     * first encounter, eliminating repeated ucwords/str_replace calls for the same header
+     * name across every response in the process lifetime.
+     *
+     * @var array<string, string>
+     */
+    private static array $headerNameCache = [];
 
     /**
      * @param ConnectionInterface $connection The raw TCP/TLS connection
      * @param callable(Request, ProtocolHandlerInterface): void $onRequest Callback triggered when a full request is parsed
-     * @param int $maxBodySize Limit for request body buffering in bytes (Default: 10MB)
+     * @param int $maxBodySize Maximum body size in bytes for buffered (non-streaming) requests.
+     *                         In buffered mode this governs both the per-chunk cap (chunked TE)
+     *                         and the total accumulated body limit. In streaming mode neither
+     *                         limit applies so the application layer controls consumption and
+     *                         back-pressure via the RequestBodyStream pause/resume interface.
+     *                         Individual chunk sizes in streaming mode are independently capped
+     *                         at MAX_STREAMING_CHUNK_SIZE as a memory safety bound.
      * @param bool $streamingRequests True to enable streaming request bodies
+     * @param int $maxHeaderSize Maximum total size of the header block in bytes.
+     * @param int $maxHeaderCount Maximum number of header fields allowed per request.
      */
     public function __construct(
         private readonly ConnectionInterface $connection,
         private readonly mixed $onRequest,
         private readonly int $maxBodySize = 10485760,
-        private readonly bool $streamingRequests = false
-    ) {
-    }
+        private readonly bool $streamingRequests = false,
+        private readonly int $maxHeaderSize = 8192,
+        private readonly int $maxHeaderCount = 100
+    ) {}
 
     /**
      * @inheritDoc
@@ -75,6 +183,16 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     /**
      * @inheritDoc
+     *
+     * Appends incoming TCP data to the internal receive buffer and drives the protocol
+     * state machine forward. Two key optimisations over the naive implementation:
+     *
+     *  1. Phase dispatch uses a match expression (compiled to a jump table by OPcache)
+     *     rather than a sequential if-chain, removing O(state-index) comparisons per tick.
+     *
+     *  2. Buffer consumption is tracked via $bufferOffset rather than repeated substr()
+     *     slices, so the receive buffer is only reallocated once per handleData() call
+     *     (in compactBuffer()) instead of once per phase transition.
      */
     public function handleData(string $data): void
     {
@@ -84,37 +202,24 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
         $this->buffer .= $data;
 
-        while ($this->buffer !== '') {
-            if ($this->state === self::STATE_HEADERS) {
-                if (! $this->parseHeadersPhase()) {
-                    return;
-                }
-            }
+        while ($this->bufferOffset < \strlen($this->buffer)) {
+            $advanced = match ($this->state) {
+                self::STATE_HEADERS => $this->parseHeadersPhase(),
+                self::STATE_BODY_LENGTH => $this->parseBodyLengthPhase(),
+                self::STATE_CHUNK_SIZE => $this->parseChunkSizePhase(),
+                self::STATE_CHUNK_DATA => $this->parseChunkDataPhase(),
+                self::STATE_CHUNK_TRAILER => $this->parseChunkTrailerPhase(),
+                default => false,
+            };
 
-            if ($this->state === self::STATE_BODY_LENGTH) {
-                if (! $this->parseBodyLengthPhase()) {
-                    return;
-                }
-            }
-
-            if ($this->state === self::STATE_CHUNK_SIZE) {
-                if (! $this->parseChunkSizePhase()) {
-                    return;
-                }
-            }
-
-            if ($this->state === self::STATE_CHUNK_DATA) {
-                if (! $this->parseChunkDataPhase()) {
-                    return;
-                }
-            }
-
-            if ($this->state === self::STATE_CHUNK_TRAILER) {
-                if (! $this->parseChunkTrailerPhase()) {
-                    return;
-                }
+            if (! $advanced) {
+                break;
             }
         }
+
+        // Compact the dead consumed prefix exactly once per TCP read event — rather than
+        // after every phase transition and keeping total allocation to a single substr call.
+        $this->compactBuffer();
     }
 
     /**
@@ -127,15 +232,23 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
      *
      * @param Response $response
      *
-     * @return void
+     * @inheritDoc
      */
     public function writeResponse(Response $response): void
     {
+        // RFC 9931 section 8: a rejected CONNECT MUST force connection closure to prevent
+        // optimistically-pipelined data from being parsed as subsequent HTTP requests.
+        if (
+            $this->currentRequest !== null
+            && $this->currentRequest->getMethod() === 'CONNECT'
+            && $response->getStatusCode() >= 400
+        ) {
+            $this->willCloseConnection = true;
+        }
+
         $body = $response->getBody();
         $isStreamingOut = ! \is_string($body);
-
         $version = $response->getProtocolVersion() === '1.1' ? $this->activeResponseVersion : $response->getProtocolVersion();
-        $headerBlock = "HTTP/{$version} {$response->getStatusCode()} {$response->getReasonPhrase()}\r\n";
         $headers = $response->getHeaders();
 
         if (! isset($headers['server'])) {
@@ -159,18 +272,25 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             $headers['connection'] = ['keep-alive'];
         }
 
+        $lines = ["HTTP/{$version} {$response->getStatusCode()} {$response->getReasonPhrase()}"];
+
         foreach ($headers as $name => $values) {
-            $displayName = str_replace(' ', '-', ucwords(str_replace('-', ' ', $name)));
+            $displayName = self::formatHeaderNameForWire($name);
             foreach ((array) $values as $value) {
-                $headerBlock .= "{$displayName}: {$value}\r\n";
+                $lines[] = "{$displayName}: {$value}";
             }
         }
-        $headerBlock .= "\r\n";
+
+        $headerBlock = implode("\r\n", $lines) . "\r\n\r\n";
 
         if (\is_string($body)) {
             $this->connection->write($headerBlock . $body);
             if ($shouldClose) {
                 $this->connection->close();
+                // Prevent the state machine from parsing any bytes still in the buffer
+                // after a connection close (e.g. optimistically-pipelined data after
+                // a rejected CONNECT per RFC 9931 section 8, or any Connection: close tear-down).
+                $this->state = self::STATE_UPGRADED;
             }
         } else {
             $this->connection->write($headerBlock);
@@ -189,6 +309,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                 }
                 if ($shouldClose) {
                     $this->connection->close();
+                    $this->state = self::STATE_UPGRADED;
                 }
             });
 
@@ -205,7 +326,14 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     {
         $this->state = self::STATE_UPGRADED;
 
-        return $this->buffer;
+        $remaining = $this->bufferOffset < \strlen($this->buffer)
+            ? substr($this->buffer, $this->bufferOffset)
+            : '';
+
+        $this->buffer = '';
+        $this->bufferOffset = 0;
+
+        return $remaining;
     }
 
     /**
@@ -219,32 +347,55 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
      */
     private function parseHeadersPhase(): bool
     {
-        $this->buffer = ltrim($this->buffer, "\r\n");
+        $bufLen = \strlen($this->buffer);
 
-        if ($this->buffer === '') {
+        while (
+            $this->bufferOffset < $bufLen
+            && ($this->buffer[$this->bufferOffset] === "\r" || $this->buffer[$this->bufferOffset] === "\n")
+        ) {
+            $this->bufferOffset++;
+        }
+
+        $available = $bufLen - $this->bufferOffset;
+
+        if ($available === 0) {
             return false;
         }
 
-        $headerEndPos = strpos($this->buffer, "\r\n\r\n");
+        $headerEndPos = strpos($this->buffer, "\r\n\r\n", $this->bufferOffset);
 
         if ($headerEndPos === false) {
-            if (\strlen($this->buffer) > self::MAX_HEADER_SIZE) {
+            if ($available > $this->maxHeaderSize) {
                 $this->sendErrorAndClose(431, 'Request Header Fields Too Large');
             }
 
             return false;
         }
 
-        $rawHeaders = substr($this->buffer, 0, $headerEndPos);
-        $this->buffer = substr($this->buffer, $headerEndPos + 4);
+        if ($headerEndPos - $this->bufferOffset > $this->maxHeaderSize) {
+            $this->sendErrorAndClose(431, 'Request Header Fields Too Large');
+
+            return false;
+        }
+
+        $rawHeaders = substr($this->buffer, $this->bufferOffset, $headerEndPos - $this->bufferOffset);
+        $this->bufferOffset = $headerEndPos + 4;
 
         try {
             $this->parseHeaders($rawHeaders);
-        } catch (PayloadTooLargeException $e) {
+        } catch (PayloadTooLargeException) {
             $this->sendErrorAndClose(413, 'Payload Too Large');
 
             return false;
-        } catch (\Throwable $e) {
+        } catch (RequestHeaderFieldsTooLargeException) {
+            $this->sendErrorAndClose(431, 'Request Header Fields Too Large');
+
+            return false;
+        } catch (UnsupportedTransferCodingException) {
+            $this->sendErrorAndClose(501, 'Not Implemented');
+
+            return false;
+        } catch (\Throwable) {
             $this->sendErrorAndClose(400, 'Bad Request');
 
             return false;
@@ -254,19 +405,21 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             return false;
         }
 
+        // RFC 9110 Section 10.1.1: Automatically signal the client to send the body
+        // if the headers were successfully parsed and accepted.
+        if (strtolower($this->currentRequest->getHeaderLine('expect')) === '100-continue') {
+            $this->connection->write("HTTP/1.1 100 Continue\r\n\r\n");
+        }
+
         if ($this->streamingRequests) {
             $this->bodyStream = new RequestBodyStream();
-
             $this->bodyStream->on('pause', $this->connection->pause(...));
             $this->bodyStream->on('resume', $this->connection->resume(...));
-
             $this->currentRequest->setBody($this->bodyStream);
 
             if (\is_callable($this->onRequest)) {
                 ($this->onRequest)($this->currentRequest, $this);
             }
-        } else {
-            $this->currentRequest->setBody('');
         }
 
         if ($this->isChunked) {
@@ -280,22 +433,36 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         return true;
     }
 
+    /**
+     * Reads a fixed-length request body from the buffer.
+     *
+     * Uses min() to derive the consumable chunk size in a single expression,
+     * avoiding a redundant strlen() call on a freshly allocated substr result.
+     */
     private function parseBodyLengthPhase(): bool
     {
-        $remainingNeeded = $this->expectedBodyLength - $this->bytesRead;
-        $chunk = substr($this->buffer, 0, $remainingNeeded);
-        $chunkLength = \strlen($chunk);
+        $bufLen = \strlen($this->buffer);
+        $remaining = $this->expectedBodyLength - $this->bytesRead;
+        $available = $bufLen - $this->bufferOffset;
+        $chunkLength = min($remaining, $available);
 
-        $this->buffer = substr($this->buffer, $chunkLength);
+        if ($chunkLength === 0) {
+            return false;
+        }
+
+        $chunk = substr($this->buffer, $this->bufferOffset, $chunkLength);
+        $this->bufferOffset += $chunkLength;
         $this->bytesRead += $chunkLength;
 
-        $this->pushBodyData($chunk);
+        if (! $this->pushBodyData($chunk)) {
+            return false;
+        }
 
         if ($this->bytesRead >= $this->expectedBodyLength) {
             $this->finalizeRequest();
         }
 
-        return $this->buffer !== '';
+        return $this->bufferOffset < $bufLen;
     }
 
     /**
@@ -304,18 +471,43 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
      * Complies with RFC 9112 section 7.1.2 by transitioning the state machine to consume
      * the trailer section once the terminal zero-size chunk is encountered.
      *
+     * Enforces strict ctype_xdigit verification to mitigate TE.TE smuggling vectors.
+     *
      * @return bool True if a chunk size was parsed, false if waiting for more data.
      */
     private function parseChunkSizePhase(): bool
     {
-        $pos = strpos($this->buffer, "\r\n");
+        $pos = strpos($this->buffer, "\r\n", $this->bufferOffset);
+
         if ($pos === false) {
+            if (\strlen($this->buffer) - $this->bufferOffset > self::MAX_CHUNK_LINE_SIZE) {
+                $this->sendErrorAndClose(400, 'Bad Request');
+            }
+
             return false;
         }
 
-        $hex = trim(explode(';', substr($this->buffer, 0, $pos))[0]);
+        $line = substr($this->buffer, $this->bufferOffset, $pos - $this->bufferOffset);
+        $this->bufferOffset = $pos + 2;
+        $extPos = strpos($line, ';');
+        $hex = $extPos !== false ? rtrim(substr($line, 0, $extPos)) : trim($line);
+
+        if ($hex === '' || ! ctype_xdigit($hex)) {
+            $this->sendErrorAndClose(400, 'Bad Request');
+
+            return false;
+        }
+
+        //hex strings >= 16 digits exceed PHP_INT_MAX on 64-bit systems.
+        // hexdec() silently returns a float; (int) cast produces platform-dependent
+        // garbage (typically -1 or PHP_INT_MIN) that corrupts the chunk-data read path.
+        if (\strlen($hex) > 15) {
+            $this->sendErrorAndClose(400, 'Bad Request');
+
+            return false;
+        }
+
         $this->currentChunkSize = (int) hexdec($hex);
-        $this->buffer = substr($this->buffer, $pos + 2);
 
         if ($this->currentChunkSize === 0) {
             $this->state = self::STATE_CHUNK_TRAILER;
@@ -323,18 +515,80 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             return $this->parseChunkTrailerPhase();
         }
 
+        // Enforce a per-chunk size cap before entering STATE_CHUNK_DATA.
+        // Without this, a client that declares a chunk larger than the cap and then
+        // dribbles data holds the connection open while the buffer grows unbounded and
+        // parseChunkDataPhase() waits for the full declared size and pushBodyData()'s
+        // accumulated-size check is never reached.
+        //
+        // The cap differs by mode because maxBodySize means different things:
+        //   - Buffered mode: maxBodySize is both the per-chunk and total body limit.
+        //   - Streaming mode: maxBodySize is intentionally not enforced as a body limit
+        //     (the application layer owns that policy via back-pressure). A separate
+        //     constant caps individual chunk sizes purely as a memory safety bound.
+        $chunkSizeLimit = $this->streamingRequests
+            ? self::MAX_STREAMING_CHUNK_SIZE
+            : $this->maxBodySize;
+
+        if ($this->currentChunkSize > $chunkSizeLimit) {
+            $this->sendErrorAndClose(413, 'Payload Too Large');
+
+            return false;
+        }
+
         $this->state = self::STATE_CHUNK_DATA;
 
         return true;
     }
 
+    /**
+     * Parses payload chunk data up to the previously extracted chunk size.
+     */
     private function parseChunkDataPhase(): bool
     {
-        if (\strlen($this->buffer) >= $this->currentChunkSize + 2) {
-            $chunk = substr($this->buffer, 0, $this->currentChunkSize);
-            $this->pushBodyData($chunk);
+        $available = \strlen($this->buffer) - $this->bufferOffset;
 
-            $this->buffer = substr($this->buffer, $this->currentChunkSize + 2);
+        if ($available === 0) {
+            return false;
+        }
+
+        if ($this->streamingRequests) {
+            $remaining = $this->currentChunkSize - $this->chunkBytesRead;
+            $canRead = min($remaining, $available);
+
+            if ($canRead > 0) {
+                $chunk = substr($this->buffer, $this->bufferOffset, $canRead);
+                $this->bufferOffset += $canRead;
+                $this->chunkBytesRead += $canRead;
+
+                if (! $this->pushBodyData($chunk)) {
+                    return false;
+                }
+            }
+
+            if ($this->chunkBytesRead >= $this->currentChunkSize) {
+                if (\strlen($this->buffer) - $this->bufferOffset < 2) {
+                    return false;
+                }
+
+                $this->bufferOffset += 2;
+                $this->chunkBytesRead = 0;
+                $this->state = self::STATE_CHUNK_SIZE;
+
+                return true;
+            }
+
+            return false;
+        }
+
+        if ($available >= $this->currentChunkSize + 2) {
+            $chunk = substr($this->buffer, $this->bufferOffset, $this->currentChunkSize);
+
+            if (! $this->pushBodyData($chunk)) {
+                return false;
+            }
+
+            $this->bufferOffset += $this->currentChunkSize + 2;
             $this->state = self::STATE_CHUNK_SIZE;
 
             return true;
@@ -346,55 +600,68 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     /**
      * Consumes the chunked trailer section (RFC 9112 section 7.1.2).
      *
-     * After the terminal "0\r\n" chunk, the wire format consists of zero or more
-     * trailer fields followed by an empty line (CRLF). This method skips the
-     * trailers entirely (as permitted by the RFC) and advances the buffer past
-     * the terminating CRLF boundary before finalizing the request.
-     *
      * @return bool True if the trailer section was fully consumed, false otherwise.
      */
     private function parseChunkTrailerPhase(): bool
     {
-        if (str_starts_with($this->buffer, "\r\n")) {
-            $this->buffer = substr($this->buffer, 2);
+        $bufLen = \strlen($this->buffer);
+        $available = $bufLen - $this->bufferOffset;
+
+        if (
+            $available >= 2
+            && $this->buffer[$this->bufferOffset] === "\r"
+            && $this->buffer[$this->bufferOffset + 1] === "\n"
+        ) {
+            $this->bufferOffset += 2;
             $this->finalizeRequest();
 
-            return $this->buffer !== '';
+            return $this->bufferOffset < $bufLen;
         }
 
-        $trailerEnd = strpos($this->buffer, "\r\n\r\n");
+        $trailerEnd = strpos($this->buffer, "\r\n\r\n", $this->bufferOffset);
+
         if ($trailerEnd === false) {
+            if ($available > $this->maxHeaderSize) {
+                $this->sendErrorAndClose(400, 'Bad Request');
+            }
+
             return false;
         }
 
-        $this->buffer = substr($this->buffer, $trailerEnd + 4);
+        $this->bufferOffset = $trailerEnd + 4;
         $this->finalizeRequest();
 
-        return $this->buffer !== '';
+        return $this->bufferOffset < $bufLen;
     }
 
-    private function pushBodyData(string $data): void
+    /**
+     * Pushes a body chunk to either the live stream or the buffered chunk list.
+     *
+     * @return bool False if this push triggered a 413 and closed the connection
+     */
+    private function pushBodyData(string $data): bool
     {
         if ($this->currentRequest === null) {
-            return;
+            return true;
         }
 
         if ($this->streamingRequests && $this->bodyStream !== null) {
             $this->bodyStream->push($data);
-        } else {
-            $body = $this->currentRequest->getBody();
-            if (! \is_string($body)) {
-                return;
-            }
 
-            $newBody = $body . $data;
-            if (\strlen($newBody) > $this->maxBodySize) {
-                $this->sendErrorAndClose(413, 'Payload Too Large');
-
-                return;
-            }
-            $this->currentRequest->setBody($newBody);
+            return true;
         }
+
+        $this->bufferedBodyBytes += \strlen($data);
+
+        if ($this->bufferedBodyBytes > $this->maxBodySize) {
+            $this->sendErrorAndClose(413, 'Payload Too Large');
+
+            return false;
+        }
+
+        $this->bodyChunks[] = $data;
+
+        return true;
     }
 
     private function finalizeRequest(): void
@@ -406,85 +673,163 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         if ($this->streamingRequests && $this->bodyStream !== null) {
             $this->bodyStream->end();
         } else {
+            $this->currentRequest->setBody(implode('', $this->bodyChunks));
+
             if (\is_callable($this->onRequest)) {
                 ($this->onRequest)($this->currentRequest, $this);
             }
         }
 
-        $this->state = self::STATE_HEADERS;
+        if ($this->state !== self::STATE_UPGRADED) {
+            $this->state = self::STATE_HEADERS;
+        }
+
         $this->currentRequest = null;
         $this->bodyStream = null;
+        $this->bodyChunks = [];
         $this->isChunked = false;
         $this->expectedBodyLength = 0;
         $this->bytesRead = 0;
+        $this->bufferedBodyBytes = 0;
     }
 
     /**
      * Parses the raw header block into a Request value object.
      *
      * This method strictly applies RFC 9112 structural validations. Violations result
-     * in an InvalidArgumentException, which triggers a 400 Bad Request response.
+     * in a MessageParsingException, which triggers a 400 Bad Request response.
      *
      * Enforced RFC 9112 rules:
      * - section 2.2: Absorbs any stray empty lines between the start of the message and the request-line.
-     * - section 2.3: Validates HTTP version format and case sensitivity (e.g., "HTTP/1.1").
-     * - section 3.2: Enforces that the Host header is mandatory and singular for HTTP/1.1 requests.
-     * - section 5.1: Rejects any whitespace between the field name and the colon.
+     * - section 2.2: Rejects a bare CR (a CR not immediately followed by LF) within the request-line or header field line.
+     * - section 2.3: Validates HTTP version format and case sensitivity.
+     * - section 3.1 / 5.5: Enforces strict VCHAR/Token validation to block control characters in methods and headers.
+     * - section 3.2: Enforces that the Host header is mandatory, singular, and does not contain a comma-separated list.
+     * - section 5.1: Rejects whitespace between field name and colon, or lines with no colon.
      * - section 5.2: Rejects Obsolete Line Folding (obs-fold) to prevent request smuggling.
-     * - section 6.1: Parses Transfer-Encoding as a list, treating the request as chunked only if "chunked" is the final coding.
-     * - section 6.2: Rejects multiple conflicting Content-Length values as a smuggling vector.
-     * - section 6.3: Removes Content-Length entirely if Transfer-Encoding is present, preventing conflicting body length calculations.
+     * - section 6.1: Enforces mandatory connection closure if both Transfer-Encoding and Content-Length are present.
+     * - section 6.3: Validates TE chains. 400 Bad Request if recognized but not chunked-terminated, 501 if unrecognized.
+     * - section 6.3: Removes Content-Length entirely if Transfer-Encoding is present.
+     * - section 4:   chunked MUST appear exactly once and MUST be the final coding (TE.TE smuggling prevention).
      *
      * @param string $rawHeaders The raw HTTP header string including the request line.
      *
      * @throws MessageParsingException If any structural validation fails.
+     * @throws UnsupportedTransferCodingException If Transfer-Encoding names an unrecognized coding.
      * @throws PayloadTooLargeException If the calculated Content-Length exceeds the configured maximum body size.
      */
     private function parseHeaders(string $rawHeaders): void
     {
-        $lines = explode("\r\n", $rawHeaders);
-        $requestLine = array_shift($lines);
-
-        while ($requestLine === '' && \count($lines) > 0) {
-            $requestLine = array_shift($lines);
-        }
+        $firstCrLf = strpos($rawHeaders, "\r\n");
+        $requestLine = $firstCrLf !== false ? substr($rawHeaders, 0, $firstCrLf) : $rawHeaders;
+        $headerBody = $firstCrLf !== false ? substr($rawHeaders, $firstCrLf + 2) : '';
 
         if ($requestLine === '') {
             throw new MessageParsingException('Empty request line');
         }
 
-        $parts = explode(' ', $requestLine);
-        if (\count($parts) !== 3) {
+        if (str_contains($requestLine, "\r")) {
+            throw new MessageParsingException('Bare CR is not permitted in the request line');
+        }
+
+        if (substr_count($requestLine, ' ') !== 2) {
             throw new MessageParsingException('Invalid Request Line');
         }
 
-        if (preg_match('/^HTTP\/\d\.\d$/', $parts[2]) !== 1) {
+        $s1 = (int) strpos($requestLine, ' ');
+        $s2 = (int) strrpos($requestLine, ' ');
+
+        $method = substr($requestLine, 0, $s1);
+        $target = substr($requestLine, $s1 + 1, $s2 - $s1 - 1);
+        $version = substr($requestLine, $s2 + 1);
+
+        if ($method === '' || preg_match('/[^\x21-\x7E]|[()<>@,;:\\\\"\/\[\]?={}]/', $method) === 1) {
+            throw new MessageParsingException('Invalid characters in request method');
+        }
+
+        if ($target === '' || preg_match('/[\x00-\x1F\x7F]/', $target) === 1) {
+            throw new MessageParsingException('Invalid control character in request target');
+        }
+
+        if (
+            \strlen($version) !== 8
+            || strncmp($version, 'HTTP/', 5) !== 0
+            || $version[6] !== '.'
+            || ! ctype_digit($version[5])
+            || ! ctype_digit($version[7])
+        ) {
             throw new MessageParsingException('Invalid HTTP version: must match HTTP/DIGIT.DIGIT');
         }
 
         $headers = [];
+        $offset = 0;
+        $headerBodyLen = \strlen($headerBody);
+        $headerCount = 0;
 
-        foreach ($lines as $line) {
+        while ($offset < $headerBodyLen) {
+            $nextCrLf = strpos($headerBody, "\r\n", $offset);
+
+            if ($nextCrLf === false) {
+                $line = substr($headerBody, $offset);
+                $offset = $headerBodyLen;
+            } else {
+                $line = substr($headerBody, $offset, $nextCrLf - $offset);
+                $offset = $nextCrLf + 2;
+            }
+
             if ($line !== '' && ($line[0] === ' ' || $line[0] === "\t")) {
                 throw new MessageParsingException('Obsolete line folding (obs-fold) is not permitted in requests');
             }
 
+            if (++$headerCount > $this->maxHeaderCount) {
+                throw new RequestHeaderFieldsTooLargeException('Too many header fields');
+            }
+
+            // RFC 9112 section 2.2: a bare CR within a field line must be rejected rather
+            // than passed through as a literal byte in the parsed field value. Since the
+            // line was extracted by scanning for a literal "\r\n", any "\r" still present
+            // here is by definition a CR not immediately followed by LF.
+            if (str_contains($line, "\r")) {
+                throw new MessageParsingException('Bare CR is not permitted within a header field line');
+            }
+
             $colonPos = strpos($line, ':');
+
             if ($colonPos === false) {
-                continue;
+                throw new MessageParsingException("Malformed header field line: \"{$line}\"");
             }
 
             $rawFieldName = substr($line, 0, $colonPos);
-            $fieldValue = trim(substr($line, $colonPos + 1));
+
+            if (\strlen($rawFieldName) > self::MAX_HEADER_NAME_LENGTH) {
+                throw new RequestHeaderFieldsTooLargeException("Header field name exceeds maximum allowed length: \"{$rawFieldName}\"");
+            }
+
+            $fieldValue = trim(substr($line, $colonPos + 1), " \t");
 
             if ($rawFieldName !== rtrim($rawFieldName)) {
                 throw new MessageParsingException("Whitespace before colon is not permitted in field name: \"{$rawFieldName}\"");
             }
 
+            // RFC 9110 section 5.1: field names must conform to the token rule that is a visible ASCII.
+            // Only (0x21–0x7E), excluding the delimiter set: ( ) < > @ , ; : \ " / [ ] ? = { }
+            // The colon is structurally impossible here (extracted via strpos), but included
+            // in the pattern for completeness. The whitespace check above already catches
+            // trailing SP/HT, but the token rule is broader so null bytes, other controls,
+            // and delimiter chars must also be rejected to prevent proxy differential attacks
+            // where a front-end normalizes a malformed name that this parser silently accepted.
+            if ($rawFieldName === '' || preg_match('/[^\x21-\x7E]|[()<>@,;:\\\\"\/\[\]?={}]/', $rawFieldName) === 1) {
+                throw new MessageParsingException("Invalid characters in field name: \"{$rawFieldName}\"");
+            }
+
+            if (preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $fieldValue) === 1) {
+                throw new MessageParsingException("Invalid control character in header field value for: \"{$rawFieldName}\"");
+            }
+
             $headers[strtolower($rawFieldName)][] = $fieldValue;
         }
 
-        $protocolVersion = substr($parts[2], 5);
+        $protocolVersion = substr($version, 5);
 
         if ($protocolVersion === '1.1') {
             if (! isset($headers['host'])) {
@@ -493,58 +838,114 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             if (\count($headers['host']) > 1) {
                 throw new MessageParsingException('HTTP/1.1 requests MUST NOT contain more than one Host header field');
             }
+            if (str_contains($headers['host'][0], ',')) {
+                throw new MessageParsingException('Host header field must not contain a comma-separated list');
+            }
         }
 
         $this->isChunked = false;
+        $this->expectedBodyLength = 0;
+        $forceClose = false;
 
-        if (isset($headers['transfer-encoding'])) {
+        $hasTe = isset($headers['transfer-encoding']);
+        $hasCl = isset($headers['content-length']);
+
+        if ($hasTe && $hasCl) {
+            $forceClose = true;
+        }
+
+        // RFC 9112 section 6.1: a server receiving an HTTP/1.0 message containing Transfer-Encoding
+        // MUST treat the framing as faulty and close the connection after responding, even if
+        // a Content-Length is present and even if the client requests keep-alive. HTTP/1.0
+        // predates Transfer-Encoding so no compliant 1.0 sender should ever produce it so
+        // its presence almost certainly means a proxy stripped the chunked framing in transit
+        // and the message boundary is now untrustworthy.
+        if ($hasTe && $protocolVersion === '1.0') {
+            $forceClose = true;
+        }
+
+        if ($hasTe) {
+            $teVals = $headers['transfer-encoding'];
             $codings = [];
-            foreach ($headers['transfer-encoding'] as $value) {
+
+            foreach ($teVals as $value) {
                 foreach (array_map('trim', explode(',', $value)) as $coding) {
                     if ($coding !== '') {
                         $codings[] = strtolower($coding);
                     }
                 }
             }
-            $this->isChunked = $codings !== [] && end($codings) === 'chunked';
-        }
 
-        $this->expectedBodyLength = 0;
+            if ($codings === []) {
+                throw new MessageParsingException('Malformed Transfer-Encoding chain');
+            }
 
-        if (isset($headers['content-length'])) {
-            $clRaw = [];
-            foreach ($headers['content-length'] as $val) {
-                foreach (array_map('trim', explode(',', $val)) as $v) {
-                    if ($v !== '') {
-                        $clRaw[] = $v;
-                    }
+            $lastCoding = end($codings);
+
+            // RFC 9112 section 6.1: chunked MUST appear exactly once and MUST be the final coding.
+            // A duplicated chunked anywhere earlier in the chain is the TE.TE smuggling vector —
+            // different hops process different occurrences and disagree on where the body ends.
+            $intermediateCodings = \array_slice($codings, 0, -1);
+            if (\in_array('chunked', $intermediateCodings, true)) {
+                throw new MessageParsingException(
+                    'chunked transfer-encoding must appear only as the final coding'
+                );
+            }
+
+            if ($lastCoding !== 'chunked') {
+                $knownCodings = ['chunked', 'compress', 'deflate', 'gzip', 'x-compress', 'x-gzip'];
+
+                if (\in_array($lastCoding, $knownCodings, true)) {
+                    throw new MessageParsingException('Transfer-Encoding chain must end with chunked');
                 }
+
+                throw new UnsupportedTransferCodingException("Unsupported transfer coding: \"{$lastCoding}\"");
             }
 
-            $uniqueCl = array_unique($clRaw);
+            // Note: The parser intentionally do NOT validate intermediate codings here.
+            // Intermediaries or the application layer MAY process compressed codings
+            // (e.g. gzip, chunked) internally. It only care that framing terminates in 'chunked'.
 
-            if (\count($uniqueCl) > 1) {
-                throw new MessageParsingException('Multiple conflicting Content-Length values');
-            }
+            $this->isChunked = true;
 
-            $this->expectedBodyLength = (int) reset($uniqueCl);
-        }
-
-        if ($this->isChunked) {
+            // RFC 9112 section 6.1/6.3: once Transfer-Encoding is confirmed to resolve to
+            // chunked framing, Content-Length is discarded outright
             unset($headers['content-length']);
             $this->expectedBodyLength = 0;
+        } elseif ($hasCl) {
+            $clVals = $headers['content-length'];
+
+            if (\count($clVals) === 1 && ! str_contains($clVals[0], ',')) {
+                $this->expectedBodyLength = $this->parseContentLengthValue($clVals[0]);
+            } else {
+                $clRaw = [];
+                foreach ($clVals as $val) {
+                    foreach (array_map('trim', explode(',', $val)) as $v) {
+                        if ($v !== '') {
+                            $clRaw[] = $v;
+                        }
+                    }
+                }
+
+                $uniqueCl = array_unique($clRaw);
+
+                if (\count($uniqueCl) > 1) {
+                    throw new MessageParsingException('Multiple conflicting Content-Length values');
+                }
+
+                $this->expectedBodyLength = $this->parseContentLengthValue((string) reset($uniqueCl));
+            }
         }
 
         $serverParams = ['REMOTE_ADDR' => $this->connection->getRemoteAddress()];
-
-        $this->currentRequest = new Request($parts[0], $parts[1], $headers, '', $protocolVersion, $serverParams);
+        $this->currentRequest = new Request($method, $target, $headers, '', $protocolVersion, $serverParams);
 
         $connHeader = strtolower($this->currentRequest->getHeaderLine('connection'));
         if ($this->currentRequest->getProtocolVersion() === '1.0') {
-            $this->willCloseConnection = ($connHeader !== 'keep-alive');
+            $this->willCloseConnection = $forceClose || ($connHeader !== 'keep-alive');
             $this->activeResponseVersion = '1.0';
         } else {
-            $this->willCloseConnection = ($connHeader === 'close');
+            $this->willCloseConnection = $forceClose || ($connHeader === 'close');
             $this->activeResponseVersion = '1.1';
         }
 
@@ -553,10 +954,66 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         }
     }
 
+    /**
+     * Validates and parses a single Content-Length field value.
+     *
+     * RFC 9110 section 8.6 requires Content-Length to be an unsigned string of decimal
+     * digits so no leading "+"/"-" sign, no surrounding non-digit characters. A value
+     * that doesn't match this grammar is an unrecoverable framing error per RFC 9112
+     * section 6.3 and must never be silently coerced via a numeric cast: PHP's (int)
+     * cast on "10abc" yields 10 and on "-5" yields -5, either of which would desync
+     * this server's view of the body boundary from any front-end proxy in front of it.
+     *
+     * @throws MessageParsingException If the value isn't a valid unsigned decimal digit string.
+     */
+    private function parseContentLengthValue(string $value): int
+    {
+        $trimmed = trim($value);
+
+        if ($trimmed === '' || ! ctype_digit($trimmed)) {
+            throw new MessageParsingException("Invalid Content-Length value: \"{$value}\"");
+        }
+
+        return (int) $trimmed;
+    }
+
     private function sendErrorAndClose(int $statusCode, string $reason): void
     {
         $this->connection->write("HTTP/1.1 {$statusCode} {$reason}\r\nConnection: close\r\n\r\n");
         $this->connection->close();
         $this->state = self::STATE_UPGRADED;
+    }
+
+    /**
+     * Reclaims memory from the processed segment of the TCP buffer.
+     */
+    private function compactBuffer(): void
+    {
+        if ($this->bufferOffset === 0) {
+            return;
+        }
+
+        $this->buffer = $this->bufferOffset < \strlen($this->buffer)
+            ? substr($this->buffer, $this->bufferOffset)
+            : '';
+
+        $this->bufferOffset = 0;
+    }
+
+    /**
+     * Converts internal lowercase headers (e.g., "content-type") to
+     * standard HTTP/1.1 Title-Case wire format (e.g., "Content-Type").
+     */
+    private static function formatHeaderNameForWire(string $name): string
+    {
+        if (isset(self::$headerNameCache[$name])) {
+            return self::$headerNameCache[$name];
+        }
+
+        if (\count(self::$headerNameCache) > self::MAX_HEADER_CACHE_SIZE) {
+            self::$headerNameCache = [];
+        }
+
+        return self::$headerNameCache[$name] = str_replace(' ', '-', ucwords(str_replace('-', ' ', $name)));
     }
 }
