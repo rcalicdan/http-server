@@ -172,6 +172,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         private readonly int $maxHeaderSize = 8192,
         private readonly int $maxHeaderCount = 100
     ) {
+        $this->handleConnectionCloseEvent();
     }
 
     /**
@@ -292,7 +293,29 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                 $this->connection->write($headerBlock . $body);
             }
         } else {
+            if (! $body->isReadable()) {
+                $finalPayload = $headerBlock;
+                if ($isChunkedResponse) {
+                    $finalPayload .= "0\r\n\r\n";
+                }
+
+                if ($shouldClose) {
+                    $this->connection->end($finalPayload);
+                    $this->state = self::STATE_UPGRADED;
+                } else {
+                    $this->connection->write($finalPayload);
+                }
+
+                return;
+            }
+
             $this->connection->write($headerBlock);
+
+            $connectionCloseListener = function () use ($body) {
+                $body->close();
+            };
+
+            $this->connection->on('close', $connectionCloseListener);
 
             $body->on('data', function (string $chunk) use ($isChunkedResponse) {
                 if ($isChunkedResponse) {
@@ -302,9 +325,10 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                 }
             });
 
-            $body->on('end', function () use ($isChunkedResponse, $shouldClose) {
-                $finalChunk = $isChunkedResponse ? "0\r\n\r\n" : '';
+            $body->on('end', function () use ($isChunkedResponse, $shouldClose, $connectionCloseListener) {
+                $this->connection->removeListener('close', $connectionCloseListener);
 
+                $finalChunk = $isChunkedResponse ? "0\r\n\r\n" : '';
                 if ($shouldClose) {
                     if ($finalChunk !== '') {
                         $this->connection->end($finalChunk);
@@ -319,8 +343,13 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                 }
             });
 
-            $body->on('error', function () {
+            $body->on('error', function () use ($connectionCloseListener) {
+                $this->connection->removeListener('close', $connectionCloseListener);
                 $this->connection->close();
+            });
+
+            $body->on('close', function () use ($connectionCloseListener) {
+                $this->connection->removeListener('close', $connectionCloseListener);
             });
         }
     }
@@ -340,6 +369,20 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         $this->bufferOffset = 0;
 
         return $remaining;
+    }
+
+    /**
+     * Ensure the Protcol Parser able to gracefully handle client connection abrupt closing gracefully.
+     */
+    private function handleConnectionCloseEvent(): void
+    {
+        $this->connection->on('close', function () {
+            if ($this->bodyStream !== null && $this->bodyStream->isReadable()) {
+                $this->bodyStream->close();
+            }
+
+            $this->state = self::STATE_UPGRADED;
+        });
     }
 
     /**

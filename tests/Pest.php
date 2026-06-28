@@ -6,6 +6,11 @@ use Hibla\HttpServer\HttpServer;
 use Hibla\Socket\Interfaces\ConnectionInterface;
 use Hibla\Socket\SocketServer;
 
+function debug(string $message): void
+{
+    fwrite(STDERR, "[DEBUG] {$message}\n");
+}
+
 function getServerProperty(HttpServer $server, string $property): mixed
 {
     $reflection = new ReflectionClass($server);
@@ -67,9 +72,11 @@ function createTestServer(
     int $maxBodySize = 10485760,
     bool $streamingRequests = false,
     int $maxHeaderSize = 8192,
-    int $maxHeaderCount = 100
+    int $maxHeaderCount = 100,
+    array $context = []
 ): array {
-    $socket = new SocketServer('tcp://127.0.0.1:0');
+    $scheme = isset($context['tls']) ? 'tls://' : 'tcp://';
+    $socket = new SocketServer($scheme . '127.0.0.1:0', $context);
 
     HttpServer::attachProtocolHandler(
         $socket,
@@ -80,7 +87,7 @@ function createTestServer(
         $maxHeaderCount
     );
 
-    $url = str_replace('tcp://', 'http://', $socket->getAddress());
+    $url = str_replace(['tcp://', 'tls://'], ['http://', 'https://'], $socket->getAddress());
 
     return [$socket, $url];
 }
