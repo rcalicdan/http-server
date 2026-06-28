@@ -103,8 +103,7 @@ describe('Core HTTP Functionality', function () {
                         $resolveEvents(true);
                     }
                 })
-                ->connect()
-            ;
+                ->connect();
 
             $connection = await($promise);
             await($eventsCollected);
@@ -146,7 +145,6 @@ describe('Core HTTP Functionality', function () {
             $socket->close();
         }
     });
-
 });
 
 describe('Browser-Like Simulation', function () {
@@ -253,7 +251,7 @@ describe('Browser-Like Simulation', function () {
             expect($htmlResponse->status())->toBe(200);
 
             $assets = ['/style.css', '/app.js', '/logo.png'];
-            $promises = array_map(fn ($asset) => Http::get($url . $asset), $assets);
+            $promises = array_map(fn($asset) => Http::get($url . $asset), $assets);
 
             $responses = await(Promise::all($promises));
 
@@ -298,7 +296,6 @@ describe('Advanced Client-Server Interactions', function () {
             expect($response->status())->toBe(200)
                 ->and($response->body())->toContain('Fully streamed')
             ;
-
         } finally {
             $socket->close();
         }
@@ -318,7 +315,6 @@ describe('Advanced Client-Server Interactions', function () {
             expect($response->status())->toBe(200)
                 ->and($response->body())->toBe('URI: /api/search?q=hibla+async&filters%5Bactive%5D=true&filters%5Bid%5D=42')
             ;
-
         } finally {
             $socket->close();
         }
@@ -351,7 +347,6 @@ describe('Advanced Client-Server Interactions', function () {
 
             $badResponse = await(Http::client()->get($url));
             expect($badResponse->status())->toBe(401);
-
         } finally {
             $socket->close();
         }
@@ -374,8 +369,8 @@ describe('Advanced Client-Server Interactions', function () {
 
             $teapot = await(Http::get($url . '/teapot'));
             expect($teapot->status())->toBe(418)
-                ->and($teapot->body())->toBe('Short and stout');
-
+                ->and($teapot->body())->toBe('Short and stout')
+            ;
         } finally {
             $socket->close();
         }

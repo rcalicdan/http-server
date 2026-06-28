@@ -169,7 +169,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         private readonly mixed $onRequest,
         private readonly int $maxBodySize = 10485760,
         private readonly bool $streamingRequests = false,
-        private readonly int $maxHeaderSize = 8192,
+        private readonly int $maxHeaderSize = 16384,
         private readonly int $maxHeaderCount = 100
     ) {
         $this->handleConnectionCloseEvent();
