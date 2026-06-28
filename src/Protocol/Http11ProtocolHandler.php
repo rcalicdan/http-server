@@ -31,7 +31,7 @@ use Hibla\Socket\Interfaces\ConnectionInterface;
  *
  * Parses the request-line and header fields. Enforces the token rule on field names,
  * rejects obs-fold (obsolete line folding), bare CRs, and non-conforming version strings.
- * Validates the Transfer-Encoding chain — chunked MUST be the final coding and MUST NOT
+ * Validates the Transfer-Encoding chain so chunked MUST be the final coding and MUST NOT
  * appear more than once; a duplicate chunked earlier in the chain is the TE.TE
  * request-smuggling vector. Content-Length is validated as a string of unsigned decimal
  * digits; conflicting values produce a 400 Bad Request. Implements chunked transfer
@@ -60,13 +60,17 @@ use Hibla\Socket\Interfaces\ConnectionInterface;
  *
  * - MAX_HEADER_SIZE (8 KiB) caps header block accumulation to prevent memory
  *   exhaustion from clients that never send the "\r\n\r\n" terminator (→ 431).
+ *
  * - MAX_CHUNK_LINE_SIZE (1 KiB) prevents unbounded buffer growth when a client
  *   streams a chunk-size line without a terminating CRLF (→ 400).
+ *
  * - Hex chunk sizes are rejected when they exceed 15 digits; beyond that hexdec()
  *   silently returns a float whose (int) cast is platform-dependent and could
  *   produce a negative chunk size, corrupting the read path entirely.
+ *
  * - In streaming mode individual chunk sizes are capped at MAX_STREAMING_CHUNK_SIZE
  *   (16 MiB) as a memory-safety bound independent of application-layer back-pressure.
+ *
  * - Per-process header name formatting is memoised in $headerNameCache to avoid
  *   repeated ucwords/str_replace allocations for the same field name across every
  *   response in the process lifetime. The cache is bounded at MAX_HEADER_CACHE_SIZE
@@ -729,6 +733,10 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             throw new MessageParsingException('Invalid characters in request method');
         }
 
+        if ($target === '' || preg_match('/[\x00-\x1F\x7F]/', $target) === 1) {
+            throw new MessageParsingException('Invalid control character in request target');
+        }
+
         if (
             \strlen($version) !== 8
             || strncmp($version, 'HTTP/', 5) !== 0
@@ -773,7 +781,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             }
 
             $rawFieldName = substr($line, 0, $colonPos);
-            $fieldValue = trim(substr($line, $colonPos + 1));
+            $fieldValue = trim(substr($line, $colonPos + 1), " \t");
 
             if ($rawFieldName !== rtrim($rawFieldName)) {
                 throw new MessageParsingException("Whitespace before colon is not permitted in field name: \"{$rawFieldName}\"");
@@ -819,6 +827,16 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         $hasCl = isset($headers['content-length']);
 
         if ($hasTe && $hasCl) {
+            $forceClose = true;
+        }
+
+        // RFC 9112 section 6.1: a server receiving an HTTP/1.0 message containing Transfer-Encoding
+        // MUST treat the framing as faulty and close the connection after responding, even if
+        // a Content-Length is present and even if the client requests keep-alive. HTTP/1.0
+        // predates Transfer-Encoding so no compliant 1.0 sender should ever produce it so
+        // its presence almost certainly means a proxy stripped the chunked framing in transit
+        // and the message boundary is now untrustworthy.
+        if ($hasTe && $protocolVersion === '1.0') {
             $forceClose = true;
         }
 

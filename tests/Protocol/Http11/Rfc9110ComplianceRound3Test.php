@@ -140,3 +140,49 @@ describe('RFC 9112 section 3.1 & 5.5 — Token and VCHAR strictness', function (
     });
 
 });
+
+describe('RFC 9112 sectio 6.1 — HTTP/1.0 with Transfer-Encoding must force connection closure', function () {
+
+    it('forces connection closure for an HTTP/1.0 request carrying Transfer-Encoding even when Connection: keep-alive is requested', function () {
+        $buffer = '';
+        $connection = mockConnection($buffer, expectClose: true);
+
+        $requestCount = 0;
+        $handler = new Http11ProtocolHandler(
+            $connection,
+            function (Request $request, ProtocolHandlerInterface $protocol) use (&$requestCount) {
+                $requestCount++;
+                $protocol->writeResponse(new Response(200, [], 'OK'));
+            }
+        );
+
+        $raw = "POST / HTTP/1.0\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n"
+            . "5\r\nhello\r\n0\r\n\r\n"
+            . "GET /second HTTP/1.0\r\n\r\n";
+
+        $handler->handleData($raw);
+
+        expect($requestCount)->toBe(1);
+    });
+
+});
+
+describe('RFC 9110 section 10.1.1 — unknown Expect directive handling', function () {
+
+    it('silently ignores an unrecognized Expect directive without sending 417', function () {
+        $buffer = '';
+        $connection = mockConnection($buffer);
+
+        $parsedRequest = null;
+        $handler = new Http11ProtocolHandler($connection, function (Request $request) use (&$parsedRequest) {
+            $parsedRequest = $request;
+        });
+
+        $handler->handleData("GET / HTTP/1.1\r\nHost: localhost\r\nExpect: unknown-directive\r\n\r\n");
+
+        expect($parsedRequest)->not->toBeNull()
+            ->and($buffer)->not->toContain('417')
+        ;
+    });
+
+});

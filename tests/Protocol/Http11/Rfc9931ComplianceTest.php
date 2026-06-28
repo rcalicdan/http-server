@@ -39,3 +39,31 @@ describe('RFC 9931 Section 8 — Requirements for HTTP CONNECT', function () {
     });
 
 });
+
+describe('RFC 9931 Section 8 — CONNECT with a request body', function () {
+
+    it('discards a pipelined request arriving after a rejected CONNECT that carried a chunked body', function () {
+        $buffer = '';
+        $connection = mockConnection($buffer, expectClose: true);
+
+        $requestCount = 0;
+        $handler = new Http11ProtocolHandler(
+            $connection,
+            function (Request $request, ProtocolHandlerInterface $protocol) use (&$requestCount) {
+                $requestCount++;
+                $protocol->writeResponse(new Response(405, [], 'Method Not Allowed'));
+            }
+        );
+
+        $raw = "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n"
+            . "5\r\nhello\r\n0\r\n\r\n"
+            . "GET /smuggled HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        $handler->handleData($raw);
+
+        expect($requestCount)->toBe(1)
+            ->and($buffer)->toContain('HTTP/1.1 405')
+        ;
+    });
+
+});

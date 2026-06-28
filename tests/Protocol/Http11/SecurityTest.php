@@ -817,3 +817,59 @@ describe('State machine — Per-request state reset integrity', function () {
     });
 
 });
+
+describe('Request Target — control character injection', function () {
+
+    it('rejects a request target containing a null byte', function () {
+        $buffer = '';
+        $connection = mockConnection($buffer, expectClose: true);
+
+        $requestReached = false;
+        $handler = new Http11ProtocolHandler($connection, function () use (&$requestReached) {
+            $requestReached = true;
+        });
+
+        $handler->handleData("GET /path\x00evil HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        expect($buffer)->toContain('HTTP/1.1 400 Bad Request')
+            ->and($requestReached)->toBeFalse()
+        ;
+    });
+
+    it('rejects a request target containing a bare CR', function () {
+        $buffer = '';
+        $connection = mockConnection($buffer, expectClose: true);
+
+        $requestReached = false;
+        $handler = new Http11ProtocolHandler($connection, function () use (&$requestReached) {
+            $requestReached = true;
+        });
+
+        $handler->handleData("GET /path\revil HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        expect($buffer)->toContain('HTTP/1.1 400 Bad Request')
+            ->and($requestReached)->toBeFalse()
+        ;
+    });
+
+});
+
+describe('Content-Length — PHP integer saturation at upper boundary', function () {
+
+    it('rejects Content-Length of PHP_INT_MAX + 1 as Payload Too Large without integer saturation bypass', function () {
+        $buffer = '';
+        $connection = mockConnection($buffer, expectClose: true);
+
+        $requestReached = false;
+        $handler = new Http11ProtocolHandler($connection, function () use (&$requestReached) {
+            $requestReached = true;
+        });
+
+        $handler->handleData("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 9223372036854775808\r\n\r\n");
+
+        expect($buffer)->toContain('HTTP/1.1 413')
+            ->and($requestReached)->toBeFalse()
+        ;
+    });
+
+});
