@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Hibla\HttpServer\HttpServer;
 use Hibla\Socket\Interfaces\ConnectionInterface;
+use Hibla\Socket\SocketServer;
 
 function getServerProperty(HttpServer $server, string $property): mixed
 {
@@ -46,4 +47,30 @@ function mockStreamingConnection(string &$buffer): ConnectionInterface
     $connection->shouldReceive('resume')->zeroOrMoreTimes();
 
     return $connection;
+}
+
+/**
+ * @return array{0: SocketServer, 1: string}
+ */
+function createTestServer(
+    callable $requestHandler,
+    int $maxBodySize = 10485760,
+    bool $streamingRequests = false,
+    int $maxHeaderSize = 8192,
+    int $maxHeaderCount = 100
+): array {
+    $socket = new SocketServer('tcp://127.0.0.1:0');
+    
+    HttpServer::attachProtocolHandler(
+        $socket,
+        $requestHandler,
+        $maxBodySize,
+        $streamingRequests,
+        $maxHeaderSize,
+        $maxHeaderCount
+    );
+    
+    $url = str_replace('tcp://', 'http://', $socket->getAddress());
+    
+    return [$socket, $url];
 }

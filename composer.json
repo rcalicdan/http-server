@@ -34,6 +34,7 @@
         "phpstan/phpstan": "^2.1",
         "phpstan/phpstan-strict-rules": "^2.0",
         "phpstan/extension-installer": "^1.4",
+        "hiblaphp/http-client": "^1.0",
         "rcalicdan/defer": "^1.0"
     },
     "config": {
@@ -42,7 +43,7 @@
             "phpstan/extension-installer": true
         }
     },
-     "scripts": {
+    "scripts": {
         "test": "./vendor/bin/pest",
         "format": "./vendor/bin/pint",
         "format-test": "./vendor/bin/pint --test",
