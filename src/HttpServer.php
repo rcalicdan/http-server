@@ -89,6 +89,11 @@ final class HttpServer implements HttpServerInterface
     private int $maxHeaderCount = 100;
 
     /**
+     * @var float Maximum time allowed in seconds to finish active requests during shutdown (Default: 15.0)
+     */
+    private float $gracefulShutdownTimeout = 15.0;
+
+    /**
      * @var array<string, mixed> Socket context options
      */
     private array $context = [];
@@ -280,6 +285,9 @@ final class HttpServer implements HttpServerInterface
         return $clone;
     }
 
+    /**
+     * {@inheritdoc}
+     */
     public function withHeaderTimeout(?float $seconds): static
     {
         $clone = clone $this;
@@ -288,10 +296,28 @@ final class HttpServer implements HttpServerInterface
         return $clone;
     }
 
+    /**
+     * {@inheritdoc}
+     */
     public function withKeepAliveTimeout(?float $seconds): static
     {
         $clone = clone $this;
         $clone->keepAliveTimeout = $seconds;
+
+        return $clone;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function withGracefulShutdownTimeout(float $seconds): static
+    {
+        if ($seconds <= 0) {
+            throw new InvalidConfigurationException('Graceful shutdown timeout must be a positive number greater than zero.');
+        }
+
+        $clone = clone $this;
+        $clone->gracefulShutdownTimeout = $seconds;
 
         return $clone;
     }
@@ -317,13 +343,45 @@ final class HttpServer implements HttpServerInterface
         }
     }
 
+    /**
+     * @param callable():int $triggerShutdown
+     * @param float $timeout
+     */
+    private function executeGracefulDraining(callable $triggerShutdown, float $timeout): void
+    {
+        $activeCount = $triggerShutdown();
+
+        if ($activeCount === 0) {
+            $this->log('No active connections. Shutting down immediately.');
+            Loop::stop();
+
+            return;
+        }
+
+        $this->log("Waiting for {$activeCount} active request(s) to finish (Timeout: {$timeout}s)...");
+
+        $timeoutId = Loop::addTimer($timeout, function () {
+            $this->log('Graceful shutdown timeout reached. Forcing exit.');
+            Loop::stop();
+        });
+
+        Loop::addPeriodicTimer(0.1, function ($timerId) use ($timeoutId, $triggerShutdown) {
+            if ($triggerShutdown() === 0) {
+                Loop::cancelTimer($timerId);
+                Loop::cancelTimer($timeoutId);
+                $this->log('All requests finished cleanly. Exiting.');
+                Loop::stop();
+            }
+        });
+    }
+
     private function runCustomSocket(callable $requestHandler): void
     {
         if ($this->customSocketServer === null) {
             return;
         }
 
-        self::attachProtocolHandler(
+        $triggerShutdown = self::attachProtocolHandler(
             $this->customSocketServer,
             $requestHandler,
             $this->maxBodySize,
@@ -332,11 +390,19 @@ final class HttpServer implements HttpServerInterface
             $this->maxHeaderCount
         );
 
-        $this->setupSignalHandlers(function () {
+        $this->setupSignalHandlers(function () use ($triggerShutdown) {
+            static $shuttingDown = false;
+            if ($shuttingDown) {
+                return;
+            }
+            $shuttingDown = true;
+
+            $this->log("\nInitiating graceful shutdown...");
             if ($this->customSocketServer !== null) {
                 $this->customSocketServer->close();
             }
-            Loop::stop();
+
+            $this->executeGracefulDraining($triggerShutdown, $this->gracefulShutdownTimeout);
         });
 
         $this->log('HTTP Server running on custom socket instance.');
@@ -359,7 +425,7 @@ final class HttpServer implements HttpServerInterface
             );
         }
 
-        self::attachProtocolHandler(
+        $triggerShutdown = self::attachProtocolHandler(
             $socket,
             $requestHandler,
             $this->maxBodySize,
@@ -368,10 +434,17 @@ final class HttpServer implements HttpServerInterface
             $this->maxHeaderCount
         );
 
-        $this->setupSignalHandlers(function () use ($socket) {
-            $this->log("\nStopping HTTP Server (Single Process Mode)...");
+        $this->setupSignalHandlers(function () use ($socket, $triggerShutdown) {
+            static $shuttingDown = false;
+            if ($shuttingDown) {
+                return;
+            }
+            $shuttingDown = true;
+
+            $this->log("\nInitiating graceful shutdown (Single Process Mode)...");
             $socket->close();
-            Loop::stop();
+
+            $this->executeGracefulDraining($triggerShutdown, $this->gracefulShutdownTimeout);
         });
 
         $this->log("HTTP Server listening on {$this->getDisplayUri()} (Single Process Mode)");
@@ -403,7 +476,8 @@ final class HttpServer implements HttpServerInterface
             $this->maxHeaderCount,
             $this->headerTimeout,
             $this->keepAliveTimeout,
-            $this->onStartCallback
+            $this->onStartCallback,
+            $this->gracefulShutdownTimeout
         );
 
         $isShuttingDown = false;
@@ -515,6 +589,8 @@ final class HttpServer implements HttpServerInterface
      * Wires the socket events to the protocol handler.
      *
      * @internal This is for internal usage and testing purposes.
+     *
+     * @return \Closure A callback that triggers graceful shutdown and returns the active connection count.
      */
     public static function attachProtocolHandler(
         ServerInterface $socket,
@@ -525,8 +601,10 @@ final class HttpServer implements HttpServerInterface
         int $maxHeaderCount = 100,
         ?float $headerTimeout = null,
         ?float $keepAliveTimeout = null
-    ): void {
-        $socket->on('connection', static function (ConnectionInterface $connection) use ($requestHandler, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount, $headerTimeout, $keepAliveTimeout) {
+    ): \Closure {
+        $activeHandlers = [];
+
+        $socket->on('connection', static function (ConnectionInterface $connection) use ($requestHandler, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount, $headerTimeout, $keepAliveTimeout, &$activeHandlers) {
             $protocolHandler = new Http11ProtocolHandler($connection, function (Request $request, ProtocolHandlerInterface $protocol) use ($requestHandler) {
                 $fiber = new \Fiber(function () use ($requestHandler, $request, $protocol) {
                     try {
@@ -548,9 +626,26 @@ final class HttpServer implements HttpServerInterface
                 Loop::addFiber($fiber);
             }, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount, $headerTimeout, $keepAliveTimeout);
 
+            $handlerId = spl_object_id($protocolHandler);
+            $activeHandlers[$handlerId] = $protocolHandler;
+
+            $connection->on('close', static function () use ($handlerId, &$activeHandlers) {
+                unset($activeHandlers[$handlerId]);
+            });
+
             $connection->on('data', static function (string $data) use ($protocolHandler) {
                 $protocolHandler->handleData($data);
             });
         });
+
+        return static function () use (&$activeHandlers): int {
+            $count = 0;
+            foreach ($activeHandlers as $handler) {
+                $handler->gracefulShutdown();
+                $count++;
+            }
+
+            return $count;
+        };
     }
 }

@@ -120,6 +120,8 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     private bool $willCloseConnection = false;
 
+    private bool $isProcessingRequest = false;
+
     private int $state = self::STATE_HEADERS;
 
     private int $expectedBodyLength = 0;
@@ -325,6 +327,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                 $this->connection->write($headerBlock . $body);
                 $this->handleKeepAliveState();
             }
+            $this->isProcessingRequest = false;
         } else {
             if (! $body->isReadable()) {
                 $finalPayload = $headerBlock;
@@ -339,6 +342,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                     $this->connection->write($finalPayload);
                     $this->handleKeepAliveState();
                 }
+                $this->isProcessingRequest = false;
 
                 return;
             }
@@ -382,15 +386,18 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                     }
                     $this->handleKeepAliveState();
                 }
+                $this->isProcessingRequest = false;
             });
 
             $body->on('error', function () use ($connectionCloseListener) {
                 $this->connection->removeListener('close', $connectionCloseListener);
                 $this->connection->close();
+                $this->isProcessingRequest = false;
             });
 
             $body->on('close', function () use ($connectionCloseListener) {
                 $this->connection->removeListener('close', $connectionCloseListener);
+                $this->isProcessingRequest = false;
             });
 
             $body->resume();
@@ -413,6 +420,26 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         $this->bufferOffset = 0;
 
         return $remaining;
+    }
+
+    /**
+     * Signals the protocol handler to gracefully shut down.
+     *
+     * If the handler is currently processing a request, it will finish processing it,
+     * append a "Connection: close" header to the response, and then close the socket.
+     * If the handler is currently idle (Keep-Alive state), it will immediately close
+     * the underlying connection.
+     */
+    public function gracefulShutdown(): void
+    {
+        $this->willCloseConnection = true;
+
+        // If no request is currently being processed, it is safe to close the connection immediately.
+        if (! $this->isProcessingRequest) {
+            $this->cancelAllTimers();
+            $this->connection->close();
+            $this->state = self::STATE_UPGRADED;
+        }
     }
 
     /**
@@ -513,6 +540,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             $this->bodyStream->on('resume', $this->connection->resume(...));
             $this->currentRequest->setBody($this->bodyStream);
 
+            $this->isProcessingRequest = true;
             if (\is_callable($this->onRequest)) {
                 ($this->onRequest)($this->currentRequest, $this);
             }
@@ -771,6 +799,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         } else {
             $this->currentRequest->setBody(implode('', $this->bodyChunks));
 
+            $this->isProcessingRequest = true;
             if (\is_callable($this->onRequest)) {
                 ($this->onRequest)($this->currentRequest, $this);
             }
@@ -1163,10 +1192,14 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     private function cancelKeepAliveTimer(): void
     {
-        if ($this->keepAliveTimerId !== null) {
-            Loop::cancelTimer($this->keepAliveTimerId);
-            $this->keepAliveTimerId = null;
+        if ($this->keepAliveTimeout === null || $this->keepAliveTimerId !== null) {
+            return;
         }
+
+        $this->keepAliveTimerId = Loop::addTimer($this->keepAliveTimeout, function () {
+            $this->connection->close();
+            $this->state = self::STATE_UPGRADED;
+        });
     }
 
     private function cancelAllTimers(): void

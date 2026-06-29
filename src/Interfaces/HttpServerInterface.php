@@ -175,6 +175,18 @@ interface HttpServerInterface
     public function onStart(callable $callback): static;
 
     /**
+     * Set the maximum time allowed for graceful shutdown.
+     *
+     * If active requests do not finish within this time during a shutdown,
+     * the server will forcefully terminate them to prevent hanging indefinitely.
+     *
+     * @param float $seconds Timeout in seconds. Must be greater than 0. Default is 15.0.
+     *
+     * @return static
+     */
+    public function withGracefulShutdownTimeout(float $seconds): static;
+
+    /**
      * Start the HTTP Server and block the current thread to process incoming requests.
      *
      * @param callable $requestHandler Callback invoked for each incoming request.
