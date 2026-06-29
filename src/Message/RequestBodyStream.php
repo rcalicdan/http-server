@@ -89,7 +89,7 @@ class RequestBodyStream extends EventEmitter implements ReadableStreamInterface
      * Overridden to detect when the application starts listening for data.
      * If data arrived before the listener was attached (e.g. in the same TCP tick as the headers),
      * it is flushed out in the next tick to ensure the listener doesn't miss it.
-     * 
+     *
      * @param mixed $event
      */
     public function on($event, callable $listener): void
@@ -148,7 +148,7 @@ class RequestBodyStream extends EventEmitter implements ReadableStreamInterface
             return;
         }
 
-        if ($this->hasDataListener && $this->buffer === '') {
+        if ($this->buffer === '') {
             $this->emit('end');
             $this->close();
         } else {

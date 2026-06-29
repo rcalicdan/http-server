@@ -34,8 +34,19 @@ function mockConnection(string &$buffer, bool $expectClose = false): ConnectionI
         }
     });
 
-    $connection->shouldReceive('close')->zeroOrMoreTimes();
-    $connection->shouldReceive('end')->zeroOrMoreTimes();
+    $closeListeners = [];
+
+    $connection->shouldReceive('on')->zeroOrMoreTimes()->andReturnUsing(function (string $event, callable $listener) use (&$closeListeners) {
+        if ($event === 'close') {
+            $closeListeners[] = $listener;
+        }
+    });
+
+    $connection->shouldReceive('close')->zeroOrMoreTimes()->andReturnUsing(function () use (&$closeListeners) {
+        foreach ($closeListeners as $listener) {
+            $listener();
+        }
+    });
 
     return $connection;
 }
@@ -59,7 +70,20 @@ function mockStreamingConnection(string &$buffer): ConnectionInterface
 
     $connection->shouldReceive('pause')->zeroOrMoreTimes();
     $connection->shouldReceive('resume')->zeroOrMoreTimes();
-    $connection->shouldReceive('close')->zeroOrMoreTimes();
+
+    $closeListeners = [];
+
+    $connection->shouldReceive('on')->zeroOrMoreTimes()->andReturnUsing(function (string $event, callable $listener) use (&$closeListeners) {
+        if ($event === 'close') {
+            $closeListeners[] = $listener;
+        }
+    });
+
+    $connection->shouldReceive('close')->zeroOrMoreTimes()->andReturnUsing(function () use (&$closeListeners) {
+        foreach ($closeListeners as $listener) {
+            $listener();
+        }
+    });
 
     return $connection;
 }

@@ -151,4 +151,22 @@ describe('HttpServer Configuration & Instantiation', function () {
             ->and(getServerProperty($server, 'pauseOnLimit'))->toBeFalse()
         ;
     });
+
+    it('has a default worker restart limit of 10', function () {
+        $server = HttpServer::create();
+
+        expect(getServerProperty($server, 'workerRestartLimit'))->toBe(10);
+    });
+
+    it('can configure worker restart limit', function () {
+        $server = HttpServer::create()->withWorkerRestartLimit(5);
+
+        expect(getServerProperty($server, 'workerRestartLimit'))->toBe(5);
+    });
+
+    it('can disable the worker restart limit explicitly by passing null', function () {
+        $server = HttpServer::create()->withWorkerRestartLimit(null);
+
+        expect(getServerProperty($server, 'workerRestartLimit'))->toBeNull();
+    });
 });

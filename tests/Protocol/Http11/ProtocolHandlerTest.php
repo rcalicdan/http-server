@@ -6,14 +6,12 @@ use Hibla\HttpServer\Message\Request;
 use Hibla\HttpServer\Message\RequestBodyStream;
 use Hibla\HttpServer\Message\Response;
 use Hibla\HttpServer\Protocol\Http11ProtocolHandler;
-use Hibla\Socket\Interfaces\ConnectionInterface;
 
 it('parses a basic GET request with no body', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
+    $buffer = '';
+    $connection = mockConnection($buffer);
 
     /** @var Request|null $parsedRequest */
-
     $parsedRequest = null;
     $handler = new Http11ProtocolHandler($connection, function (Request $request) use (&$parsedRequest) {
         $parsedRequest = $request;
@@ -35,8 +33,8 @@ it('parses a basic GET request with no body', function () {
 });
 
 it('successfully parses requests delivered across multiple TCP packets', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
+    $buffer = '';
+    $connection = mockConnection($buffer);
 
     /** @var Request|null $parsedRequest */
     $parsedRequest = null;
@@ -58,8 +56,8 @@ it('successfully parses requests delivered across multiple TCP packets', functio
 });
 
 it('parses chunked transfer encoding payloads correctly', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
+    $buffer = '';
+    $connection = mockConnection($buffer);
 
     /** @var Request|null $parsedRequest */
     $parsedRequest = null;
@@ -84,26 +82,14 @@ it('parses chunked transfer encoding payloads correctly', function () {
 });
 
 it('rejects and responds with a 431 status code if headers are too large', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
-
     $writtenBuffer = '';
-    $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$writtenBuffer) {
-        $writtenBuffer .= $data;
-
-        return true;
-    });
-
-    $connection->shouldReceive('end')->andReturnUsing(function (?string $data = null) use (&$writtenBuffer) {
-        if ($data !== null) {
-            $writtenBuffer .= $data;
-        }
-    });
+    $connection = mockConnection($writtenBuffer);
 
     $handler = new Http11ProtocolHandler($connection, function () {
     });
 
-    $handler->handleData(str_repeat('X', 9000));
+    // Uses 20000 bytes to comfortably exceed the default 16KB limit in the handler
+    $handler->handleData(str_repeat('X', 20000));
 
     expect($writtenBuffer)->toContain('HTTP/1.1 431 Request Header Fields Too Large')
         ->and($writtenBuffer)->toContain('Connection: close')
@@ -111,21 +97,8 @@ it('rejects and responds with a 431 status code if headers are too large', funct
 });
 
 it('rejects and responds with a 413 status code if content-length exceeds max limit', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
-
     $writtenBuffer = '';
-    $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$writtenBuffer) {
-        $writtenBuffer .= $data;
-
-        return true;
-    });
-
-    $connection->shouldReceive('end')->andReturnUsing(function (?string $data = null) use (&$writtenBuffer) {
-        if ($data !== null) {
-            $writtenBuffer .= $data;
-        }
-    });
+    $connection = mockConnection($writtenBuffer);
 
     $handler = new Http11ProtocolHandler($connection, function () {
     }, maxBodySize: 10);
@@ -140,8 +113,8 @@ it('rejects and responds with a 413 status code if content-length exceeds max li
 });
 
 it('yields unparsed trailing bytes when detached for websocket/protocol upgrades', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
+    $buffer = '';
+    $connection = mockConnection($buffer);
 
     $handler = new Http11ProtocolHandler($connection, function () {
     });
@@ -154,15 +127,8 @@ it('yields unparsed trailing bytes when detached for websocket/protocol upgrades
 });
 
 it('correctly formats and writes response structures to the connection', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
-
     $writtenBuffer = '';
-    $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$writtenBuffer) {
-        $writtenBuffer .= $data;
-
-        return true;
-    });
+    $connection = mockConnection($writtenBuffer);
 
     $handler = new Http11ProtocolHandler($connection, function () {
     });
@@ -183,8 +149,8 @@ it('correctly formats and writes response structures to the connection', functio
 });
 
 it('handles pipelined requests sequentially in a single TCP stream payload', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
+    $buffer = '';
+    $connection = mockConnection($buffer);
 
     /** @var array<Request> $parsedRequests */
     $parsedRequests = [];
@@ -207,10 +173,9 @@ it('handles pipelined requests sequentially in a single TCP stream payload', fun
 });
 
 it('triggers onRequest immediately when streamingRequests is enabled, then pipes the body dynamically', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
-    $connection->shouldReceive('pause');
-    $connection->shouldReceive('resume');
+    $buffer = '';
+    // Uses the pre-configured mock streaming connection
+    $connection = mockStreamingConnection($buffer);
 
     /** @var Request|null $parsedRequest */
     $parsedRequest = null;
@@ -237,8 +202,8 @@ it('triggers onRequest immediately when streamingRequests is enabled, then pipes
 });
 
 it('correctly trims and ignores chunk extensions inside chunked payloads', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
+    $buffer = '';
+    $connection = mockConnection($buffer);
 
     /** @var Request|null $parsedRequest */
     $parsedRequest = null;
@@ -261,21 +226,8 @@ it('correctly trims and ignores chunk extensions inside chunked payloads', funct
 });
 
 it('responds with 400 Bad Request and terminates when the request line is structurally malformed', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
-
     $writtenBuffer = '';
-    $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$writtenBuffer) {
-        $writtenBuffer .= $data;
-
-        return true;
-    });
-
-    $connection->shouldReceive('end')->andReturnUsing(function (?string $data = null) use (&$writtenBuffer) {
-        if ($data !== null) {
-            $writtenBuffer .= $data;
-        }
-    });
+    $connection = mockConnection($writtenBuffer);
 
     $handler = new Http11ProtocolHandler($connection, function () {
     });
@@ -288,15 +240,8 @@ it('responds with 400 Bad Request and terminates when the request line is struct
 });
 
 it('automatically sends a 100 Continue response when the Expect header is present', function () {
-    $connection = Mockery::mock(ConnectionInterface::class);
-    $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
-
     $writtenBuffer = '';
-    $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$writtenBuffer) {
-        $writtenBuffer .= $data;
-
-        return true;
-    });
+    $connection = mockConnection($writtenBuffer);
 
     /** @var Request|null $parsedRequest */
     $parsedRequest = null;

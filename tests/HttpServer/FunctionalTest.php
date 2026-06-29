@@ -105,7 +105,8 @@ describe('Core HTTP Functionality', function () {
                         $resolveEvents(true);
                     }
                 })
-                ->connect();
+                ->connect()
+            ;
 
             $connection = await($promise);
             await($eventsCollected);
@@ -253,7 +254,7 @@ describe('Browser-Like Simulation', function () {
             expect($htmlResponse->status())->toBe(200);
 
             $assets = ['/style.css', '/app.js', '/logo.png'];
-            $promises = array_map(fn($asset) => Http::get($url . $asset), $assets);
+            $promises = array_map(fn ($asset) => Http::get($url . $asset), $assets);
 
             $responses = await(Promise::all($promises));
 
@@ -495,7 +496,7 @@ describe('Advanced Client-Server Interactions', function () {
 
     it('safely handles slow clients that dribble request bodies over time', function () {
         [$socket, $url] = createTestServer(function (ServerRequest $request) {
-            return ServerResponse::plaintext("Received: " . $request->getBody());
+            return ServerResponse::plaintext('Received: ' . $request->getBody());
         });
 
         try {
@@ -504,9 +505,9 @@ describe('Advanced Client-Server Interactions', function () {
 
             $connection->write("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\n");
 
-            Loop::addTimer(0.01, fn() => $connection->write("Slo"));
-            Loop::addTimer(0.02, fn() => $connection->write("w "));
-            Loop::addTimer(0.03, fn() => $connection->write("Client"));
+            Loop::addTimer(0.01, fn () => $connection->write('Slo'));
+            Loop::addTimer(0.02, fn () => $connection->write('w '));
+            Loop::addTimer(0.03, fn () => $connection->write('Client'));
 
             $responsePromise = new Promise(function ($resolve) use ($connection) {
                 $buffer = '';
@@ -522,7 +523,8 @@ describe('Advanced Client-Server Interactions', function () {
             $rawResponse = await($responsePromise);
 
             expect($rawResponse)->toContain('HTTP/1.1 200 OK')
-                ->and($rawResponse)->toContain('Received: Slow Client');
+                ->and($rawResponse)->toContain('Received: Slow Client')
+            ;
         } finally {
             $socket->close();
         }
@@ -566,7 +568,8 @@ describe('Advanced Client-Server Interactions', function () {
 
             expect($rawResponse)->toContain('HTTP/1.1 200 OK')
                 ->and($rawResponse)->toContain('HELLO')
-                ->and($rawResponse)->toContain(' WORLD');
+                ->and($rawResponse)->toContain(' WORLD')
+            ;
         } finally {
             $socket->close();
         }
@@ -582,7 +585,7 @@ describe('Advanced Client-Server Interactions', function () {
 
             return new ServerResponse(200, [
                 'Content-Type' => 'text/plain',
-                'Content-Length' => (string) filesize($tmpFile)
+                'Content-Length' => (string) filesize($tmpFile),
             ], $fileStream);
         });
 
@@ -591,7 +594,8 @@ describe('Advanced Client-Server Interactions', function () {
 
             expect($response->status())->toBe(200)
                 ->and(strlen($response->body()))->toBe(strlen($fileContent))
-                ->and($response->body())->toBe($fileContent);
+                ->and($response->body())->toBe($fileContent)
+            ;
         } finally {
             @unlink($tmpFile);
             $socket->close();

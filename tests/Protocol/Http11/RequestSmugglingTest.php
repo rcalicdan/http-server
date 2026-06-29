@@ -318,7 +318,8 @@ describe('Bare LF line terminators — parser stall behavior', function () {
         $handler->handleData("GET / HTTP/1.1\nHost: localhost\n\n");
 
         expect($requestReached)->toBeFalse()
-            ->and($buffer)->toBe('');
+            ->and($buffer)->toBe('')
+        ;
     });
 
 });

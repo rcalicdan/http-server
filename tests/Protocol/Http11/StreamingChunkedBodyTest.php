@@ -23,7 +23,7 @@ describe('Streaming — Chunked partial read: basic delivery', function () {
 
         $handler->handleData(
             "POST /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
-            . "b\r\n"
+                . "b\r\n"
         );
 
         expect($parsedRequest)->not->toBeNull()
@@ -44,7 +44,6 @@ describe('Streaming — Chunked partial read: basic delivery', function () {
         $handler->handleData('d');
         expect($received)->toBe('hello world');
     });
-
 });
 
 describe('Streaming — Chunked partial read: CRLF boundary split across TCP packets', function () {
@@ -71,7 +70,7 @@ describe('Streaming — Chunked partial read: CRLF boundary split across TCP pac
 
         $handler->handleData(
             "POST /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
-            . "5\r\nhello"
+                . "5\r\nhello"
         );
 
         expect($received)->toBe('hello');
@@ -104,7 +103,7 @@ describe('Streaming — Chunked partial read: CRLF boundary split across TCP pac
 
         $handler->handleData(
             "POST /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
-            . "3\r\nabc"
+                . "3\r\nabc"
         );
 
         expect($received)->toBe('abc');
@@ -136,7 +135,7 @@ describe('Streaming — Chunked partial read: CRLF boundary split across TCP pac
 
         $handler->handleData(
             "POST /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
-            . "2\r\nhi"
+                . "2\r\nhi"
         );
 
         expect($received)->toBe('hi');
@@ -150,7 +149,6 @@ describe('Streaming — Chunked partial read: CRLF boundary split across TCP pac
         expect($ended)->toBeTrue();
         expect($received)->toBe('hi');
     });
-
 });
 
 describe('Streaming — Chunked partial read: multi-chunk sequencing', function () {
@@ -236,7 +234,6 @@ describe('Streaming — Chunked partial read: multi-chunk sequencing', function 
 
         expect($received)->toBe('abc');
     });
-
 });
 
 describe('Streaming — Chunked partial read: end event integrity', function () {
@@ -259,6 +256,10 @@ describe('Streaming — Chunked partial read: end event integrity', function () 
         );
 
         $endCount = 0;
+
+        $parsedRequest->getBody()->on('data', function () {
+        });
+
         $parsedRequest->getBody()->on('end', function () use (&$endCount) {
             $endCount++;
         });
@@ -286,6 +287,10 @@ describe('Streaming — Chunked partial read: end event integrity', function () 
         );
 
         $endCount = 0;
+
+        $parsedRequest->getBody()->on('data', function () {
+        });
+
         $parsedRequest->getBody()->on('end', function () use (&$endCount) {
             $endCount++;
         });
@@ -300,5 +305,4 @@ describe('Streaming — Chunked partial read: end event integrity', function () 
 
         expect($endCount)->toBe(1);
     });
-
 });

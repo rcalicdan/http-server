@@ -3,3 +3,4 @@ composer.lock
 /.vscode
 index.php
 /manual
+/tests/HangingTest.php

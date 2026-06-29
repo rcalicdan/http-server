@@ -144,7 +144,7 @@ describe('RFC 9112 section 2.2 / section 3 — Header size enforcement must not 
             $requestReached = true;
         });
 
-        $oversizedValue = str_repeat('A', 9000);
+        $oversizedValue = str_repeat('A', 20000);
         $raw = "GET / HTTP/1.1\r\nHost: localhost\r\nX-Big: {$oversizedValue}\r\n\r\n";
 
         $handler->handleData($raw);

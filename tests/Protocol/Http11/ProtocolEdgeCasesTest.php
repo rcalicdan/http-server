@@ -88,7 +88,7 @@ describe('STATE_UPGRADED guard — bytes after connection close are silently dro
         $handler = new Http11ProtocolHandler($connection, function () {
         });
 
-        $handler->handleData(str_repeat('X', 9000));
+        $handler->handleData(str_repeat('X', 20000));
         expect($buffer)->toContain('431');
 
         $responseCountBefore = substr_count($buffer, 'HTTP/1.1');
@@ -487,7 +487,8 @@ describe('Chunked trailer section — deliberate discard policy', function () {
         $handler->handleData($raw);
 
         expect($parsedRequest)->not->toBeNull()
-            ->and($parsedRequest->getBody())->toBe('hello');
+            ->and($parsedRequest->getBody())->toBe('hello')
+        ;
     });
 
 });

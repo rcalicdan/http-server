@@ -57,6 +57,8 @@ final class HttpServer implements HttpServerInterface
      */
     private $bootstrapCallback = null;
 
+    private ?int $workerRestartLimit = 10;
+
     /**
      * @var int Limit for request body buffering in bytes (Default: 10MB)
      */
@@ -151,6 +153,17 @@ final class HttpServer implements HttpServerInterface
         $clone = clone $this;
         $clone->clusterEnabled = true;
         $clone->workerCount = $workers;
+
+        return $clone;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function withWorkerRestartLimit(?int $restartsPerSecond): static
+    {
+        $clone = clone $this;
+        $clone->workerRestartLimit = $restartsPerSecond;
 
         return $clone;
     }
@@ -377,6 +390,10 @@ final class HttpServer implements HttpServerInterface
 
         if ($this->bootstrapFile !== null) {
             $pool = $pool->withBootstrap($this->bootstrapFile, $this->bootstrapCallback);
+        }
+
+        if ($this->workerRestartLimit !== null) {
+            $pool = $pool->withMaxRestartPerSecond($this->workerRestartLimit);
         }
 
         $pool = $pool->onWorkerRespawn(function ($pool) use ($workerTask, $onWorkerError) {

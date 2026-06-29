@@ -42,7 +42,6 @@ describe('RFC 9112 section 2.2 — Message Parsing Robustness', function () {
             ->and($buffer)->not->toContain('400')
         ;
     });
-
 });
 
 describe('RFC 9112 section 2.3 — HTTP Version', function () {
@@ -94,7 +93,6 @@ describe('RFC 9112 section 2.3 — HTTP Version', function () {
             ->and($requestReached)->toBeFalse()
         ;
     });
-
 });
 
 describe('RFC 9112 section 3.2 — Host Header', function () {
@@ -130,7 +128,6 @@ describe('RFC 9112 section 3.2 — Host Header', function () {
             ->and($requestReached)->toBeFalse()
         ;
     });
-
 });
 
 describe('RFC 9112 section 5.1 — Field Line Parsing', function () {
@@ -166,7 +163,6 @@ describe('RFC 9112 section 5.1 — Field Line Parsing', function () {
             ->and($requestReached)->toBeFalse()
         ;
     });
-
 });
 
 describe('RFC 9112 section 5.2 — Obsolete Line Folding', function () {
@@ -202,7 +198,6 @@ describe('RFC 9112 section 5.2 — Obsolete Line Folding', function () {
             ->and($requestReached)->toBeFalse()
         ;
     });
-
 });
 
 describe('RFC 9112 section 6.2 — Content-Length', function () {
@@ -238,7 +233,6 @@ describe('RFC 9112 section 6.2 — Content-Length', function () {
             ->and($parsedRequest->getBody())->toBe('hello')
         ;
     });
-
 });
 
 describe('RFC 9112 section 6.1 / section 6.3 — Transfer-Encoding and Content-Length', function () {
@@ -288,7 +282,6 @@ describe('RFC 9112 section 6.1 / section 6.3 — Transfer-Encoding and Content-L
             ->and($parsedRequest->getBody())->toBe('hello')
         ;
     });
-
 });
 
 describe('RFC 9112 section 7.1.2 — Chunked Trailer Section', function () {
@@ -350,7 +343,6 @@ describe('RFC 9112 section 7.1.2 — Chunked Trailer Section', function () {
             ->and($buffer)->not->toContain('400')
         ;
     });
-
 });
 
 describe('RFC 9112 section 9.3 — Connection Persistence', function () {
@@ -375,6 +367,9 @@ describe('RFC 9112 section 9.3 — Connection Persistence', function () {
         $buffer = '';
         $connection = Mockery::mock(ConnectionInterface::class);
         $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
+
+        $connection->shouldReceive('on')->zeroOrMoreTimes();
+
         $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$buffer) {
             $buffer .= $data;
 
@@ -393,7 +388,6 @@ describe('RFC 9112 section 9.3 — Connection Persistence', function () {
 
         expect($buffer)->toContain('200');
     });
-
 });
 
 describe('RFC 9112 section 9.6 — Connection Tear-down', function () {
@@ -415,5 +409,4 @@ describe('RFC 9112 section 9.6 — Connection Tear-down', function () {
 
         expect($buffer)->toContain('Connection: close');
     });
-
 });

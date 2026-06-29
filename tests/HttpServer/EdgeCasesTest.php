@@ -8,8 +8,10 @@ use Hibla\HttpServer\Message\Request as ServerRequest;
 use Hibla\HttpServer\Message\Response as ServerResponse;
 use Hibla\Promise\Promise;
 use Hibla\Socket\Connector;
+use Hibla\Stream\ThroughStream;
 
 use function Hibla\await;
+use function Hibla\delay;
 
 afterEach(function () {
     Loop::reset();
@@ -385,6 +387,118 @@ describe('Protocol Edge Cases', function () {
 
             expect($response->status())->toBe(200)
                 ->and($response->body())->toBe('text/html; charset="utf-8"; boundary=boundary_xyz')
+            ;
+        } finally {
+            $socket->close();
+        }
+    });
+
+    it('gracefully handles a client disconnecting mid-upload without crashing', function () {
+        $uploadFailedSafely = new Promise(function ($resolve) {
+            $GLOBALS['resolveUploadFail'] = $resolve;
+        });
+
+        [$socket, $url] = createTestServer(function (ServerRequest $request) {
+            $stream = $request->getBody();
+
+            $stream->on('close', function () {
+                if (isset($GLOBALS['resolveUploadFail'])) {
+                    $GLOBALS['resolveUploadFail'](true);
+                }
+            });
+
+            return new ServerResponse(200);
+        }, streamingRequests: true);
+
+        try {
+            $rawClient = new Connector();
+            $connection = await($rawClient->connect(str_replace('http://', 'tcp://', $url)));
+
+            $connection->write("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000\r\n\r\n");
+            $connection->write('0123456789');
+
+            await(delay(0.01));
+
+            $connection->close();
+
+            $result = await($uploadFailedSafely);
+            expect($result)->toBeTrue();
+        } finally {
+            unset($GLOBALS['resolveUploadFail']);
+            $socket->close();
+        }
+    });
+
+    it('stops streaming and frees resources if the client disconnects mid-download', function () {
+        $streamClosedEarly = new Promise(function ($resolve) {
+            $GLOBALS['resolveStreamClosed'] = $resolve;
+        });
+
+        [$socket, $url] = createTestServer(function (ServerRequest $request) {
+            $stream = new ThroughStream();
+
+            $stream->on('close', function () {
+                if (isset($GLOBALS['resolveStreamClosed'])) {
+                    $GLOBALS['resolveStreamClosed'](true);
+                }
+            });
+
+            Loop::addPeriodicTimer(0.01, function ($timerId) use ($stream) {
+                if (! $stream->isWritable()) {
+                    Loop::cancelTimer($timerId);
+
+                    return;
+                }
+                $stream->write("Endless data...\n");
+            });
+
+            return new ServerResponse(200, [], $stream);
+        });
+
+        try {
+            $rawClient = new Connector();
+            $connection = await($rawClient->connect(str_replace('http://', 'tcp://', $url)));
+
+            $connection->write("GET /download HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+            $connection->once('data', function () use ($connection) {
+                $connection->close();
+            });
+
+            $result = await($streamClosedEarly);
+            expect($result)->toBeTrue();
+        } finally {
+            unset($GLOBALS['resolveStreamClosed']);
+            $socket->close();
+        }
+    });
+
+    it('honors HTTP/1.0 non-persistent connections by tearing down the socket after responding', function () {
+        [$socket, $url] = createTestServer(function (ServerRequest $request) {
+            return ServerResponse::plaintext('Legacy Response');
+        });
+
+        try {
+            $rawClient = new Connector();
+            $connection = await($rawClient->connect(str_replace('http://', 'tcp://', $url)));
+
+            $connection->write("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n");
+
+            $connectionClosedPromise = new Promise(function ($resolve) use ($connection) {
+                $buffer = '';
+                $connection->on('data', function ($chunk) use (&$buffer) {
+                    $buffer .= $chunk;
+                });
+
+                $connection->on('close', function () use (&$buffer, $resolve) {
+                    $resolve($buffer);
+                });
+            });
+
+            $response = await($connectionClosedPromise);
+
+            expect($response)->toContain('HTTP/1.0 200 OK')
+                ->and($response)->toContain('Legacy Response')
             ;
         } finally {
             $socket->close();

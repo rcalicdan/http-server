@@ -127,6 +127,16 @@ interface HttpServerInterface
     public function withHeaderLimits(int $maxSize, int $maxCount): static;
 
     /**
+     * Set the maximum number of worker respawns allowed per second in cluster mode.
+     * Prevents infinite crash loops if a worker dies repeatedly.
+     *
+     * @param int $restartsPerSecond The max allowed respawns per second.
+     *
+     * @return static A new instance with the restart limit configured.
+     */
+    public function withWorkerRestartLimit(int $restartsPerSecond): static;
+
+    /**
      * Start the HTTP Server and block the current thread to process incoming requests.
      *
      * @param callable $requestHandler Callback invoked for each incoming request.
