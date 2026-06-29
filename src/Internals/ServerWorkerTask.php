@@ -35,7 +35,9 @@ final class ServerWorkerTask
         private readonly ?int $connectionLimit = null,
         private readonly bool $pauseOnLimit = true,
         private readonly int $maxHeaderSize = 8192,
-        private readonly int $maxHeaderCount = 100
+        private readonly int $maxHeaderCount = 100,
+        private readonly ?float $headerTimeout = null,
+        private readonly ?float $keepAliveTimeout = null
     ) {
     }
 
@@ -57,7 +59,9 @@ final class ServerWorkerTask
             $this->maxBodySize,
             $this->streamingRequests,
             $this->maxHeaderSize,
-            $this->maxHeaderCount
+            $this->maxHeaderCount,
+            $this->headerTimeout,
+            $this->keepAliveTimeout
         );
 
         // When this returns, the worker's Event Loop automatically takes over.

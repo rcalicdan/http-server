@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Hibla\HttpServer\Protocol;
 
+use Hibla\EventLoop\Loop;
 use Hibla\HttpServer\Exceptions\MessageParsingException;
 use Hibla\HttpServer\Exceptions\PayloadTooLargeException;
 use Hibla\HttpServer\Exceptions\RequestHeaderFieldsTooLargeException;
@@ -58,6 +59,12 @@ use Hibla\Socket\Interfaces\ConnectionInterface;
  * flushed, causing all subsequent inbound data to be silently discarded.
  *
  * ─── Security Hardening ──────────────────────────────────────────────────────────
+ *
+ * - headerTimeout caps the time allowed to receive complete HTTP headers to
+ *   prevent Slowloris attacks (→ 408).
+ *
+ * - keepAliveTimeout limits the time a persistent connection can remain idle
+ *   before being gracefully closed, preventing resource starvation.
  *
  * - maxHeaderSize (default 8 KiB) caps header block accumulation to prevent memory
  *   exhaustion from clients that never send the "\r\n\r\n" terminator (→ 431).
@@ -135,6 +142,10 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     private string $buffer = '';
 
+    private ?string $headerTimerId = null;
+
+    private ?string $keepAliveTimerId = null;
+
     /**
      * @var list<string>
      */
@@ -163,6 +174,8 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
      * @param bool $streamingRequests True to enable streaming request bodies
      * @param int $maxHeaderSize Maximum total size of the header block in bytes.
      * @param int $maxHeaderCount Maximum number of header fields allowed per request.
+     * @param float|null $headerTimeout Maximum time allowed to receive complete headers (Slowloris protection).
+     * @param float|null $keepAliveTimeout Maximum idle time allowed before closing a persistent connection.
      */
     public function __construct(
         private readonly ConnectionInterface $connection,
@@ -170,9 +183,12 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         private readonly int $maxBodySize = 10485760,
         private readonly bool $streamingRequests = false,
         private readonly int $maxHeaderSize = 16384,
-        private readonly int $maxHeaderCount = 100
+        private readonly int $maxHeaderCount = 100,
+        private readonly ?float $headerTimeout = null,
+        private readonly ?float $keepAliveTimeout = null
     ) {
         $this->handleConnectionCloseEvent();
+        $this->startHeaderTimer();
     }
 
     /**
@@ -200,6 +216,12 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     {
         if ($this->state === self::STATE_UPGRADED) {
             return;
+        }
+
+        // Transitioning from idle state to processing a new request.
+        if ($this->keepAliveTimerId !== null) {
+            $this->cancelKeepAliveTimer();
+            $this->startHeaderTimer();
         }
 
         $this->buffer .= $data;
@@ -301,6 +323,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                 $this->state = self::STATE_UPGRADED;
             } else {
                 $this->connection->write($headerBlock . $body);
+                $this->handleKeepAliveState();
             }
         } else {
             if (! $body->isReadable()) {
@@ -314,6 +337,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                     $this->state = self::STATE_UPGRADED;
                 } else {
                     $this->connection->write($finalPayload);
+                    $this->handleKeepAliveState();
                 }
 
                 return;
@@ -356,6 +380,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                     if ($finalChunk !== '') {
                         $this->connection->write($finalChunk);
                     }
+                    $this->handleKeepAliveState();
                 }
             });
 
@@ -377,6 +402,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
      */
     public function detach(): string
     {
+        $this->cancelAllTimers();
         $this->state = self::STATE_UPGRADED;
 
         $remaining = $this->bufferOffset < \strlen($this->buffer)
@@ -395,6 +421,8 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     private function handleConnectionCloseEvent(): void
     {
         $this->connection->on('close', function () {
+            $this->cancelAllTimers();
+
             if ($this->bodyStream !== null && $this->bodyStream->isReadable()) {
                 $this->bodyStream->close();
             }
@@ -450,6 +478,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
         try {
             $this->parseHeaders($rawHeaders);
+            $this->cancelHeaderTimer(); // Headers successfully received
         } catch (PayloadTooLargeException) {
             $this->sendErrorAndClose(413, 'Payload Too Large');
 
@@ -1046,6 +1075,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     private function sendErrorAndClose(int $statusCode, string $reason): void
     {
+        $this->cancelAllTimers();
         $this->connection->end("HTTP/1.1 {$statusCode} {$reason}\r\nConnection: close\r\n\r\n");
         $this->state = self::STATE_UPGRADED;
     }
@@ -1081,5 +1111,67 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         }
 
         return self::$headerNameCache[$name] = str_replace(' ', '-', ucwords(str_replace('-', ' ', $name)));
+    }
+
+    /**
+     * Handles state transition after a response has been written.
+     * Starts the header timer if pipelined requests exist, otherwise starts the keep-alive timer.
+     */
+    private function handleKeepAliveState(): void
+    {
+        if ($this->state === self::STATE_UPGRADED) {
+            return;
+        }
+
+        if (\strlen($this->buffer) > $this->bufferOffset) {
+            $this->startHeaderTimer();
+        } else {
+            $this->startKeepAliveTimer();
+        }
+    }
+
+    private function startHeaderTimer(): void
+    {
+        if ($this->headerTimeout === null || $this->headerTimerId !== null) {
+            return;
+        }
+
+        $this->headerTimerId = Loop::addTimer($this->headerTimeout, function () {
+            $this->sendErrorAndClose(408, 'Request Timeout');
+        });
+    }
+
+    private function cancelHeaderTimer(): void
+    {
+        if ($this->headerTimerId !== null) {
+            Loop::cancelTimer($this->headerTimerId);
+            $this->headerTimerId = null;
+        }
+    }
+
+    private function startKeepAliveTimer(): void
+    {
+        if ($this->keepAliveTimeout === null || $this->keepAliveTimerId !== null) {
+            return;
+        }
+
+        $this->keepAliveTimerId = Loop::addTimer($this->keepAliveTimeout, function () {
+            $this->connection->close();
+            $this->state = self::STATE_UPGRADED;
+        });
+    }
+
+    private function cancelKeepAliveTimer(): void
+    {
+        if ($this->keepAliveTimerId !== null) {
+            Loop::cancelTimer($this->keepAliveTimerId);
+            $this->keepAliveTimerId = null;
+        }
+    }
+
+    private function cancelAllTimers(): void
+    {
+        $this->cancelHeaderTimer();
+        $this->cancelKeepAliveTimer();
     }
 }

@@ -97,7 +97,9 @@ function createTestServer(
     bool $streamingRequests = false,
     int $maxHeaderSize = 8192,
     int $maxHeaderCount = 100,
-    array $context = []
+    array $context = [],
+    ?float $headerTimeout = null,
+    ?float $keepAliveTimeout = null
 ): array {
     $scheme = isset($context['tls']) ? 'tls://' : 'tcp://';
     $socket = new SocketServer($scheme . '127.0.0.1:0', $context);
@@ -108,7 +110,9 @@ function createTestServer(
         $maxBodySize,
         $streamingRequests,
         $maxHeaderSize,
-        $maxHeaderCount
+        $maxHeaderCount,
+        $headerTimeout,
+        $keepAliveTimeout
     );
 
     $url = str_replace(['tcp://', 'tls://'], ['http://', 'https://'], $socket->getAddress());

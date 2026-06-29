@@ -137,6 +137,26 @@ interface HttpServerInterface
     public function withWorkerRestartLimit(int $restartsPerSecond): static;
 
     /**
+     * Set the maximum time allowed to receive the complete HTTP request headers.
+     * Prevents Slowloris attacks. Disabled by default.
+     *
+     * @param float|null $seconds Timeout in seconds, or null to disable.
+     *
+     * @return static
+     */
+    public function withHeaderTimeout(?float $seconds): static;
+
+    /**
+     * Set the maximum idle time allowed for a persistent connection (keep-alive)
+     * to wait for the next request. Disabled by default.
+     *
+     * @param float|null $seconds Timeout in seconds, or null to disable.
+     *
+     * @return static
+     */
+    public function withKeepAliveTimeout(?float $seconds): static;
+
+    /**
      * Start the HTTP Server and block the current thread to process incoming requests.
      *
      * @param callable $requestHandler Callback invoked for each incoming request.

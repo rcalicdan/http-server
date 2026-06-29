@@ -57,6 +57,10 @@ final class HttpServer implements HttpServerInterface
      */
     private $bootstrapCallback = null;
 
+    private ?float $headerTimeout = null;
+
+    private ?float $keepAliveTimeout = null;
+
     private ?int $workerRestartLimit = 10;
 
     /**
@@ -260,6 +264,22 @@ final class HttpServer implements HttpServerInterface
         return $clone;
     }
 
+    public function withHeaderTimeout(?float $seconds): static
+    {
+        $clone = clone $this;
+        $clone->headerTimeout = $seconds;
+
+        return $clone;
+    }
+
+    public function withKeepAliveTimeout(?float $seconds): static
+    {
+        $clone = clone $this;
+        $clone->keepAliveTimeout = $seconds;
+
+        return $clone;
+    }
+
     /**
      * {@inheritdoc}
      */
@@ -360,7 +380,9 @@ final class HttpServer implements HttpServerInterface
             $this->connectionLimit,
             $this->pauseOnLimit,
             $this->maxHeaderSize,
-            $this->maxHeaderCount
+            $this->maxHeaderCount,
+            $this->headerTimeout,
+            $this->keepAliveTimeout
         );
 
         $isShuttingDown = false;
@@ -479,9 +501,11 @@ final class HttpServer implements HttpServerInterface
         int $maxBodySize = 10485760,
         bool $streamingRequests = false,
         int $maxHeaderSize = 8192,
-        int $maxHeaderCount = 100
+        int $maxHeaderCount = 100,
+        ?float $headerTimeout = null,
+        ?float $keepAliveTimeout = null
     ): void {
-        $socket->on('connection', static function (ConnectionInterface $connection) use ($requestHandler, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount) {
+        $socket->on('connection', static function (ConnectionInterface $connection) use ($requestHandler, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount, $headerTimeout, $keepAliveTimeout) {
             $protocolHandler = new Http11ProtocolHandler($connection, function (Request $request, ProtocolHandlerInterface $protocol) use ($requestHandler) {
                 $fiber = new \Fiber(function () use ($requestHandler, $request, $protocol) {
                     try {
@@ -501,7 +525,7 @@ final class HttpServer implements HttpServerInterface
                     }
                 });
                 Loop::addFiber($fiber);
-            }, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount);
+            }, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount, $headerTimeout, $keepAliveTimeout);
 
             $connection->on('data', static function (string $data) use ($protocolHandler) {
                 $protocolHandler->handleData($data);
