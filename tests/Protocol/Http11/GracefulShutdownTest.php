@@ -198,10 +198,11 @@ describe('Protocol-level Graceful Shutdown', function () {
             $wasClosed = true;
         });
 
-        $handler = new Http11ProtocolHandler($connection, function () {});
+        $handler = new Http11ProtocolHandler($connection, function () {
+        });
 
         // Send a partial request line (client is dripping headers slowly)
-        $handler->handleData("GET /slow-path HT");
+        $handler->handleData('GET /slow-path HT');
 
         $handler->gracefulShutdown();
 

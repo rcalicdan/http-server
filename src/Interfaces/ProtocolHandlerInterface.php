@@ -16,8 +16,11 @@ interface ProtocolHandlerInterface
 
     /**
      * Send a response back to the client.
+     *
+     * @param Response $response
+     * @param callable|null $onComplete Optional callback executed when the response has been fully written/streamed.
      */
-    public function writeResponse(Response $response): void;
+    public function writeResponse(Response $response, ?callable $onComplete = null): void;
 
     /**
      * Get the underlying raw TCP/TLS connection.
@@ -40,4 +43,9 @@ interface ProtocolHandlerInterface
      * Checks if the protocol handler has detached and upgraded the connection.
      */
     public function isUpgraded(): bool;
+
+    /**
+     * Get the number of active requests currently being processed by this handler.
+     */
+    public function getActiveRequestsCount(): int;
 }

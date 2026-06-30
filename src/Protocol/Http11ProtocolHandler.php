@@ -120,7 +120,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     private bool $willCloseConnection = false;
 
-    private bool $isProcessingRequest = false;
+    private int $activeRequestsCount = 0;
 
     private int $state = self::STATE_HEADERS;
 
@@ -147,6 +147,14 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     private ?string $headerTimerId = null;
 
     private ?string $keepAliveTimerId = null;
+
+    /**
+     * Callback triggered when the parser naturally responds with a 100 Continue.
+     * Exposed to the Server layer to safely sequence pipelined responses.
+     *
+     * @var \Closure(string): void|null
+     */
+    public ?\Closure $onEarlyResponse = null;
 
     /**
      * @var list<string>
@@ -257,10 +265,11 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
      * - section 9.6: A response carrying Connection: close triggers immediate connection teardown.
      *
      * @param Response $response
+     * @param callable|null $onComplete
      *
      * @inheritDoc
      */
-    public function writeResponse(Response $response): void
+    public function writeResponse(Response $response, ?callable $onComplete = null): void
     {
         // RFC 9931 section 8: a rejected CONNECT MUST force connection closure to prevent
         // optimistically-pipelined data from being parsed as subsequent HTTP requests.
@@ -319,6 +328,19 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
         $headerBlock = implode("\r\n", $lines) . "\r\n\r\n";
 
+        $completeCalled = false;
+        $triggerComplete = function () use (&$completeCalled, $onComplete) {
+            if (! $completeCalled) {
+                $completeCalled = true;
+                if ($this->activeRequestsCount > 0) {
+                    $this->activeRequestsCount--;
+                }
+                if ($onComplete !== null) {
+                    $onComplete();
+                }
+            }
+        };
+
         if (\is_string($body)) {
             if ($shouldClose) {
                 $this->connection->end($headerBlock . $body);
@@ -327,7 +349,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                 $this->connection->write($headerBlock . $body);
                 $this->handleKeepAliveState();
             }
-            $this->isProcessingRequest = false;
+            $triggerComplete();
         } else {
             if (! $body->isReadable()) {
                 $finalPayload = $headerBlock;
@@ -342,7 +364,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                     $this->connection->write($finalPayload);
                     $this->handleKeepAliveState();
                 }
-                $this->isProcessingRequest = false;
+                $triggerComplete();
 
                 return;
             }
@@ -350,7 +372,6 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             $this->connection->write($headerBlock);
 
             $connectionCloseListener = $body->close(...);
-
             $this->connection->on('close', $connectionCloseListener);
 
             $drainListener = $body->resume(...);
@@ -368,7 +389,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                 }
             });
 
-            $body->on('end', function () use ($isChunkedResponse, $shouldClose, $connectionCloseListener, $drainListener) {
+            $body->on('end', function () use ($isChunkedResponse, $shouldClose, $connectionCloseListener, $drainListener, $triggerComplete) {
                 $this->connection->removeListener('close', $connectionCloseListener);
                 $this->connection->removeListener('drain', $drainListener);
 
@@ -387,18 +408,18 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                     }
                     $this->handleKeepAliveState();
                 }
-                $this->isProcessingRequest = false;
+                $triggerComplete();
             });
 
-            $body->on('error', function () use ($connectionCloseListener) {
+            $body->on('error', function () use ($connectionCloseListener, $triggerComplete) {
                 $this->connection->removeListener('close', $connectionCloseListener);
                 $this->connection->close();
-                $this->isProcessingRequest = false;
+                $triggerComplete();
             });
 
-            $body->on('close', function () use ($connectionCloseListener) {
+            $body->on('close', function () use ($connectionCloseListener, $triggerComplete) {
                 $this->connection->removeListener('close', $connectionCloseListener);
-                $this->isProcessingRequest = false;
+                $triggerComplete();
             });
 
             $body->resume();
@@ -424,6 +445,14 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     }
 
     /**
+     * @inheritDoc
+     */
+    public function getActiveRequestsCount(): int
+    {
+        return $this->activeRequestsCount;
+    }
+
+    /**
      * {@inheritDoc}
      *
      * If the handler is currently processing a request, it will finish processing it,
@@ -444,7 +473,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         // is also treated as idle: it have no parsed request to respond to, so
         // willCloseConnection cannot help it and only headerTimeout or reverse proxies would eventually
         // close it. During shutdown the server close it immediately instead.
-        $isIdle = !$this->isProcessingRequest
+        $isIdle = $this->activeRequestsCount === 0
             && $this->state === self::STATE_HEADERS;
 
         // If it is idle, it is safe to close the connection immediately.
@@ -461,6 +490,16 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     public function isUpgraded(): bool
     {
         return $this->state === self::STATE_UPGRADED;
+    }
+
+    /**
+     * @internal Used by the pipeline queue to decrement active requests when bypassing writeResponse (e.g. Upgrades).
+     */
+    public function decrementActiveRequests(): void
+    {
+        if ($this->activeRequestsCount > 0) {
+            $this->activeRequestsCount--;
+        }
     }
 
     /**
@@ -552,7 +591,11 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         // RFC 9110 Section 10.1.1: Automatically signal the client to send the body
         // if the headers were successfully parsed and accepted.
         if (strtolower($this->currentRequest->getHeaderLine('expect')) === '100-continue') {
-            $this->connection->write("HTTP/1.1 100 Continue\r\n\r\n");
+            if ($this->onEarlyResponse !== null) {
+                ($this->onEarlyResponse)("HTTP/1.1 100 Continue\r\n\r\n");
+            } else {
+                $this->connection->write("HTTP/1.1 100 Continue\r\n\r\n");
+            }
         }
 
         if ($this->streamingRequests) {
@@ -561,7 +604,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             $this->bodyStream->on('resume', $this->connection->resume(...));
             $this->currentRequest->setBody($this->bodyStream);
 
-            $this->isProcessingRequest = true;
+            $this->activeRequestsCount++;
             if (\is_callable($this->onRequest)) {
                 ($this->onRequest)($this->currentRequest, $this);
             }
@@ -830,7 +873,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         } else {
             $this->currentRequest->setBody(implode('', $this->bodyChunks));
 
-            $this->isProcessingRequest = true;
+            $this->activeRequestsCount++;
             if (\is_callable($this->onRequest)) {
                 ($this->onRequest)($this->currentRequest, $this);
             }

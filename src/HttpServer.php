@@ -500,18 +500,17 @@ final class HttpServer implements HttpServerInterface
             ));
         };
 
-       $pool = new ProcessPool(size: $workers)
+        $pool = new ProcessPool(size: $workers)
             ->onMessage(function (WorkerMessage $message) {
                 $data = $message->data;
                 if (
-                    \is_array($data) 
-                    && ($data['type'] ?? '') === 'log' 
-                    && \is_string($data['message'] ?? null) 
+                    \is_array($data)
+                    && ($data['type'] ?? '') === 'log'
+                    && \is_string($data['message'] ?? null)
                 ) {
                     $this->log("[Worker {$message->pid}] {$data['message']}");
                 }
-            })
-        ;
+            });
 
         if ($this->workerMemoryLimit !== null) {
             $pool = $pool->withMemoryLimit($this->workerMemoryLimit);
@@ -598,7 +597,9 @@ final class HttpServer implements HttpServerInterface
     }
 
     /**
-     * Wires the socket events to the protocol handler.
+     * Wires the socket events to the protocol handler using a FIFO pipeline queue.
+     * This guarantees that concurrent Fiber processing writes HTTP pipelined responses
+     * back to the socket sequentially as mandated by RFC 9112 Section 9.3.
      *
      * @internal This is for internal usage and testing purposes.
      *
@@ -617,36 +618,149 @@ final class HttpServer implements HttpServerInterface
         $activeHandlers = [];
 
         $socket->on('connection', static function (ConnectionInterface $connection) use ($requestHandler, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount, $headerTimeout, $keepAliveTimeout, &$activeHandlers) {
-            $protocolHandler = new Http11ProtocolHandler($connection, function (Request $request, ProtocolHandlerInterface $protocol) use ($requestHandler) {
-                $fiber = new \Fiber(function () use ($requestHandler, $request, $protocol) {
+
+            $pipelineQueue = [];
+            $isFlushing = false;
+            $maxPipelineDepth = 10;
+
+            $flushQueue = null;
+            /** @var Http11ProtocolHandler|null $protocolHandler */
+            $protocolHandler = null;
+
+            $flushQueue = static function () use (&$pipelineQueue, &$isFlushing, &$flushQueue, &$protocolHandler, $maxPipelineDepth, $connection) {
+                if ($isFlushing || empty($pipelineQueue) || $protocolHandler === null) {
+                    return;
+                }
+
+                $head = $pipelineQueue[0];
+                if (! $head->isReady) {
+                    return;
+                }
+
+                $isFlushing = true;
+
+                $onComplete = static function () use (&$pipelineQueue, &$isFlushing, &$flushQueue, $maxPipelineDepth, $connection) {
+                    array_shift($pipelineQueue);
+                    $isFlushing = false;
+
+                    if (\count($pipelineQueue) < $maxPipelineDepth) {
+                        $connection->resume();
+                    }
+
+                    if ($flushQueue !== null) {
+                        $flushQueue();
+                    }
+                };
+
+                if ($head->isEarly) {
+                    // Instantly write "100 Continue" payloads in correct sequence
+                    $connection->write($head->data);
+                    $onComplete();
+                } else {
+                    if ($head->response !== null && ! $protocolHandler->isUpgraded()) {
+                        try {
+                            $protocolHandler->writeResponse($head->response, $onComplete);
+                        } catch (\Throwable $e) {
+                            try {
+                                $errorResponse = Response::plaintext("500 Internal Server Error\n" . $e->getMessage(), 500);
+                                $protocolHandler->writeResponse($errorResponse, $onComplete);
+                            } catch (\Throwable) {
+                                $connection->close();
+                                $onComplete();
+                            }
+                        }
+                    } else {
+                        // Drop safely if response is null (Connection Upgraded)
+                        if ($protocolHandler !== null) {
+                            $protocolHandler->decrementActiveRequests();
+                        }
+                        $onComplete();
+                    }
+                }
+            };
+
+            $protocolHandler = new Http11ProtocolHandler($connection, function (Request $request, ProtocolHandlerInterface $protocol) use ($requestHandler, &$pipelineQueue, &$flushQueue, $maxPipelineDepth, $connection) {
+
+                $placeholder = new \stdClass();
+                $placeholder->isEarly = false;
+                $placeholder->response = null;
+                $placeholder->isReady = false;
+
+                $pipelineQueue[] = $placeholder;
+
+                // Backpressure: Prevent 1000 fast requests behind 1 slow request
+                if (\count($pipelineQueue) >= $maxPipelineDepth) {
+                    $connection->pause();
+                }
+
+                $fiber = new \Fiber(function () use ($requestHandler, $request, $protocol, $placeholder, &$flushQueue) {
                     try {
                         $response = $requestHandler($request, $protocol);
 
-                        if (! $response instanceof Response) {
+                        if ($protocol->isUpgraded()) {
+                            $placeholder->response = null;
+                            $placeholder->isReady = true;
+                        } elseif (! $response instanceof Response) {
                             throw new InvalidResponseException('Request handler must return an instance of Response');
+                        } else {
+                            $placeholder->response = $response;
+                            $placeholder->isReady = true;
                         }
-
-                        $protocol->writeResponse($response);
                     } catch (\Throwable $e) {
                         try {
-                            $protocol->writeResponse(Response::plaintext("500 Internal Server Error\n" . $e->getMessage(), 500));
+                            if (! $protocol->isUpgraded()) {
+                                $placeholder->response = Response::plaintext("500 Internal Server Error\n" . $e->getMessage(), 500);
+                                $placeholder->isReady = true;
+                            } else {
+                                $placeholder->response = null;
+                                $placeholder->isReady = true;
+                            }
                         } catch (\Throwable) {
                             $protocol->getConnection()->close();
+
+                            return;
                         }
+                    }
+
+                    if ($flushQueue !== null) {
+                        $flushQueue();
                     }
                 });
                 Loop::addFiber($fiber);
             }, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount, $headerTimeout, $keepAliveTimeout);
 
+            $protocolHandler->onEarlyResponse = static function (string $data) use (&$pipelineQueue, &$flushQueue, $maxPipelineDepth, $connection) {
+                $placeholder = new \stdClass();
+                $placeholder->isEarly = true;
+                $placeholder->data = $data;
+                $placeholder->isReady = true;
+                $placeholder->response = null;
+
+                $pipelineQueue[] = $placeholder;
+
+                if (\count($pipelineQueue) >= $maxPipelineDepth) {
+                    $connection->pause();
+                }
+
+                if ($flushQueue !== null) {
+                    $flushQueue();
+                }
+            };
+
             $handlerId = spl_object_id($protocolHandler);
             $activeHandlers[$handlerId] = $protocolHandler;
 
-            $connection->on('close', static function () use ($handlerId, &$activeHandlers) {
+            $connection->on('close', static function () use ($handlerId, &$activeHandlers, &$pipelineQueue, &$flushQueue, &$protocolHandler) {
                 unset($activeHandlers[$handlerId]);
+                $pipelineQueue = [];
+                $flushQueue = null;
+                $protocolHandler = null;
             });
 
-            $connection->on('data', static function (string $data) use ($protocolHandler) {
-                $protocolHandler->handleData($data);
+            $connection->on('data', static function (string $data) use (&$protocolHandler) {
+                if ($protocolHandler !== null) {
+                    $protocolHandler->handleData($data);
+                }
             });
         });
 
@@ -659,7 +773,7 @@ final class HttpServer implements HttpServerInterface
                 }
 
                 $handler->gracefulShutdown();
-                $count++;
+                $count += $handler->getActiveRequestsCount();
             }
 
             return $count;
