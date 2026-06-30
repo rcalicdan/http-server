@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace Hibla\HttpServer\Internals;
 
+use Hibla\EventLoop\Loop;
 use Hibla\HttpServer\HttpServer;
 use Hibla\Socket\LimitingServer;
 use Hibla\Socket\SocketServer;
+
+use function Hibla\emit;
 
 /**
  * @internal
@@ -15,6 +18,10 @@ use Hibla\Socket\SocketServer;
  */
 final class ServerWorkerTask
 {
+    private const int SIGINT = 2;
+
+    private const int SIGTERM = 15;
+
     /**
      * @param string $uri
      * @param array<string, mixed> $context
@@ -39,7 +46,8 @@ final class ServerWorkerTask
         private readonly int $maxHeaderCount = 100,
         private readonly ?float $headerTimeout = null,
         private readonly ?float $keepAliveTimeout = null,
-        private readonly mixed $onStartCallback = null
+        private readonly mixed $onStartCallback = null,
+        private readonly float $gracefulShutdownTimeout = 15.0
     ) {
     }
 
@@ -59,7 +67,7 @@ final class ServerWorkerTask
             );
         }
 
-        HttpServer::attachProtocolHandler(
+        $triggerShutdown = HttpServer::attachProtocolHandler(
             $socket,
             $this->requestHandler,
             $this->maxBodySize,
@@ -69,6 +77,51 @@ final class ServerWorkerTask
             $this->headerTimeout,
             $this->keepAliveTimeout
         );
+
+        $gracefulShutdownTimeout = $this->gracefulShutdownTimeout;
+
+        try {
+            $handler = static function (int $signal) use ($socket, $triggerShutdown, $gracefulShutdownTimeout) {
+                static $shuttingDown = false;
+                if ($shuttingDown) {
+                    return;
+                }
+                $shuttingDown = true;
+
+                $socket->close();
+
+                $activeCount = $triggerShutdown();
+                if ($activeCount > 0) {
+                    emit([
+                        'type' => 'log',
+                        'message' => "Worker is draining {$activeCount} active connection(s) before exit.",
+                    ]);
+                }
+
+                if ($activeCount === 0) {
+                    Loop::stop();
+
+                    return;
+                }
+
+                $timeoutId = Loop::addTimer($gracefulShutdownTimeout, static function () {
+                    Loop::stop();
+                });
+
+                Loop::addPeriodicTimer(0.1, static function ($timerId) use ($timeoutId, $triggerShutdown) {
+                    if ($triggerShutdown() === 0) {
+                        Loop::cancelTimer($timerId);
+                        Loop::cancelTimer($timeoutId);
+                        Loop::stop();
+                    }
+                });
+            };
+
+            Loop::addSignal(self::SIGINT, $handler);
+            Loop::addSignal(self::SIGTERM, $handler);
+        } catch (\BadMethodCallException $e) {
+            // Signal handling falls back gracefully on unsupported platforms
+        }
 
         // When this returns, the worker's Event Loop automatically takes over.
     }

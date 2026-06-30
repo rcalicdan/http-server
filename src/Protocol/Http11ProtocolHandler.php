@@ -66,7 +66,7 @@ use Hibla\Socket\Interfaces\ConnectionInterface;
  * - keepAliveTimeout limits the time a persistent connection can remain idle
  *   before being gracefully closed, preventing resource starvation.
  *
- * - maxHeaderSize (default 8 KiB) caps header block accumulation to prevent memory
+ * - maxHeaderSize (default 16 KiB) caps header block accumulation to prevent memory
  *   exhaustion from clients that never send the "\r\n\r\n" terminator (→ 431).
  *
  * - maxHeaderCount (default 100) caps the number of headers to prevent loop/CPU
@@ -119,6 +119,8 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     private bool $isChunked = false;
 
     private bool $willCloseConnection = false;
+
+    private bool $isProcessingRequest = false;
 
     private int $state = self::STATE_HEADERS;
 
@@ -290,9 +292,9 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
         $shouldClose = $this->willCloseConnection || strtolower($response->getHeaderLine('connection')) === 'close';
 
-        if ($shouldClose && ! isset($headers['connection'])) {
+        if ($shouldClose) {
             $headers['connection'] = ['close'];
-        } elseif (! $shouldClose && $version === '1.0' && ! isset($headers['connection'])) {
+        } elseif ($version === '1.0' && ! isset($headers['connection'])) {
             $headers['connection'] = ['keep-alive'];
         }
 
@@ -325,6 +327,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                 $this->connection->write($headerBlock . $body);
                 $this->handleKeepAliveState();
             }
+            $this->isProcessingRequest = false;
         } else {
             if (! $body->isReadable()) {
                 $finalPayload = $headerBlock;
@@ -339,6 +342,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                     $this->connection->write($finalPayload);
                     $this->handleKeepAliveState();
                 }
+                $this->isProcessingRequest = false;
 
                 return;
             }
@@ -369,7 +373,8 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                 $this->connection->removeListener('drain', $drainListener);
 
                 $finalChunk = $isChunkedResponse ? "0\r\n\r\n" : '';
-                if ($shouldClose) {
+
+                if ($shouldClose || $this->willCloseConnection) {
                     if ($finalChunk !== '') {
                         $this->connection->end($finalChunk);
                     } else {
@@ -382,15 +387,18 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
                     }
                     $this->handleKeepAliveState();
                 }
+                $this->isProcessingRequest = false;
             });
 
             $body->on('error', function () use ($connectionCloseListener) {
                 $this->connection->removeListener('close', $connectionCloseListener);
                 $this->connection->close();
+                $this->isProcessingRequest = false;
             });
 
             $body->on('close', function () use ($connectionCloseListener) {
                 $this->connection->removeListener('close', $connectionCloseListener);
+                $this->isProcessingRequest = false;
             });
 
             $body->resume();
@@ -413,6 +421,46 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         $this->bufferOffset = 0;
 
         return $remaining;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * If the handler is currently processing a request, it will finish processing it,
+     * append a "Connection: close" header to the response, and then close the socket.
+     * If the handler is currently idle (Keep-Alive state), it will immediately close
+     * the underlying connection.
+     */
+    public function gracefulShutdown(): void
+    {
+        // Ignore if the connection has already been detached/upgraded
+        if ($this->state === self::STATE_UPGRADED) {
+            return;
+        }
+
+        $this->willCloseConnection = true;
+
+        // A partial-header connection (buffer non-empty but no complete request yet)
+        // is also treated as idle: it have no parsed request to respond to, so
+        // willCloseConnection cannot help it and only headerTimeout or reverse proxies would eventually
+        // close it. During shutdown the server close it immediately instead.
+        $isIdle = !$this->isProcessingRequest
+            && $this->state === self::STATE_HEADERS;
+
+        // If it is idle, it is safe to close the connection immediately.
+        if ($isIdle) {
+            $this->cancelAllTimers();
+            $this->connection->close();
+            $this->state = self::STATE_UPGRADED;
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function isUpgraded(): bool
+    {
+        return $this->state === self::STATE_UPGRADED;
     }
 
     /**
@@ -513,6 +561,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             $this->bodyStream->on('resume', $this->connection->resume(...));
             $this->currentRequest->setBody($this->bodyStream);
 
+            $this->isProcessingRequest = true;
             if (\is_callable($this->onRequest)) {
                 ($this->onRequest)($this->currentRequest, $this);
             }
@@ -627,6 +676,16 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             : $this->maxBodySize;
 
         if ($this->currentChunkSize > $chunkSizeLimit) {
+            $this->sendErrorAndClose(413, 'Payload Too Large');
+
+            return false;
+        }
+
+        // Pre-check cumulative size before parseChunkDataPhase allocates the substr.
+        // Without this, peak memory can briefly reach 2× maxBodySize: the accumulated
+        // $bodyChunks (just under maxBodySize) plus the substr allocation for the
+        // offending chunk that pushBodyData would then reject.
+        if (! $this->streamingRequests && $this->bufferedBodyBytes + $this->currentChunkSize > $this->maxBodySize) {
             $this->sendErrorAndClose(413, 'Payload Too Large');
 
             return false;
@@ -771,6 +830,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         } else {
             $this->currentRequest->setBody(implode('', $this->bodyChunks));
 
+            $this->isProcessingRequest = true;
             if (\is_callable($this->onRequest)) {
                 ($this->onRequest)($this->currentRequest, $this);
             }

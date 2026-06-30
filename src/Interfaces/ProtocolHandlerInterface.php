@@ -27,8 +27,17 @@ interface ProtocolHandlerInterface
 
     /**
      * Stop HTTP parsing and detach from the connection.
-     * Returns any unparsed bytes currently in the buffer (which may be the first
-     * frames of the newly upgraded protocol, like WebSocket frames).
+     * Returns any unparsed bytes currently in the buffer.
      */
     public function detach(): string;
+
+    /**
+     * Signals the protocol handler to gracefully shut down.
+     */
+    public function gracefulShutdown(): void;
+
+    /**
+     * Checks if the protocol handler has detached and upgraded the connection.
+     */
+    public function isUpgraded(): bool;
 }
