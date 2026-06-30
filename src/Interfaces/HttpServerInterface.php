@@ -190,11 +190,12 @@ interface HttpServerInterface
 
     /**
      * Set the maximum number of concurrent requests allowed per connection.
-     * 
+     *
      * In HTTP/1.1, this limits the depth of the pipeline queue.
      * In HTTP/2, this dictates the SETTINGS_MAX_CONCURRENT_STREAMS limit.
-     * 
+     *
      * @param int $limit Maximum concurrent requests (Default: 10)
+     *
      * @return static
      */
     public function withMaxConcurrentRequestsPerConnection(int $limit): static;

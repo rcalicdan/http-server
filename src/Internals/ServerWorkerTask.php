@@ -52,7 +52,8 @@ final class ServerWorkerTask
         private readonly mixed $onStartCallback = null,
         private readonly float $gracefulShutdownTimeout = 15.0,
         private readonly int $maxConcurrentRequestsPerConnection = 128
-    ) {}
+    ) {
+    }
 
     public function __invoke(): void
     {
