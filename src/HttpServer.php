@@ -6,13 +6,10 @@ namespace Hibla\HttpServer;
 
 use Hibla\EventLoop\Loop;
 use Hibla\HttpServer\Exceptions\InvalidConfigurationException;
-use Hibla\HttpServer\Exceptions\InvalidResponseException;
+use Hibla\HttpServer\Interfaces\ConnectionManagerInterface;
 use Hibla\HttpServer\Interfaces\HttpServerInterface;
-use Hibla\HttpServer\Interfaces\ProtocolHandlerInterface;
+use Hibla\HttpServer\Internals\Http11ConnectionManager;
 use Hibla\HttpServer\Internals\ServerWorkerTask;
-use Hibla\HttpServer\Message\Request;
-use Hibla\HttpServer\Message\Response;
-use Hibla\HttpServer\Protocol\Http11ProtocolHandler;
 use Hibla\Parallel\ProcessPool;
 use Hibla\Parallel\ValueObjects\WorkerMessage;
 use Hibla\Socket\Interfaces\ConnectionInterface;
@@ -598,10 +595,6 @@ final class HttpServer implements HttpServerInterface
     }
 
     /**
-     * Wires the socket events to the protocol handler using a FIFO pipeline queue.
-     * This guarantees that concurrent Fiber processing writes HTTP pipelined responses
-     * back to the socket sequentially as mandated by RFC 9112 Section 9.3.
-     *
      * @internal This is for internal usage and testing purposes.
      *
      * @return callable():int A callback that triggers graceful shutdown and returns the active connection count.
@@ -616,167 +609,50 @@ final class HttpServer implements HttpServerInterface
         ?float $headerTimeout = null,
         ?float $keepAliveTimeout = null
     ): callable {
-        $activeHandlers = [];
+        /** @var array<int, ConnectionManagerInterface> $activeManagers */
+        $activeManagers = [];
 
-        $socket->on('connection', static function (ConnectionInterface $connection) use ($requestHandler, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount, $headerTimeout, $keepAliveTimeout, &$activeHandlers) {
+        $socket->on('connection', static function (ConnectionInterface $connection) use (
+            $requestHandler,
+            $maxBodySize,
+            $streamingRequests,
+            $maxHeaderSize,
+            $maxHeaderCount,
+            $headerTimeout,
+            $keepAliveTimeout,
+            &$activeManagers,
+        ): void {
 
-            /** @var list<\stdClass> $pipelineQueue */
-            $pipelineQueue = [];
-            $isFlushing = false;
-            $maxPipelineDepth = 10;
+            $manager = new Http11ConnectionManager(
+                $requestHandler,
+                $maxBodySize,
+                $streamingRequests,
+                $maxHeaderSize,
+                $maxHeaderCount,
+                $headerTimeout,
+                $keepAliveTimeout
+            );
 
-            /** @var (\Closure(): void)|null $flushQueue */
-            $flushQueue = null;
-            /** @var Http11ProtocolHandler|null $protocolHandler */
-            $protocolHandler = null;
+            $managerId = spl_object_id($manager);
+            $activeManagers[$managerId] = $manager;
 
-            $flushQueue = static function () use (&$pipelineQueue, &$isFlushing, &$flushQueue, &$protocolHandler, $maxPipelineDepth, $connection) {
-                if ($isFlushing || $pipelineQueue === [] || $protocolHandler === null) {
-                    return;
-                }
-
-                $head = $pipelineQueue[0];
-                if (! $head->isReady) {
-                    return;
-                }
-
-                $isFlushing = true;
-
-                $onComplete = static function () use (&$pipelineQueue, &$isFlushing, &$flushQueue, $maxPipelineDepth, $connection) {
-                    array_shift($pipelineQueue);
-                    $isFlushing = false;
-
-                    if (\count($pipelineQueue) < $maxPipelineDepth) {
-                        $connection->resume();
-                    }
-
-                    if ($flushQueue !== null) { // @phpstan-ignore notIdentical.alwaysTrue
-                        $flushQueue();
-                    }
-                };
-
-                if ($head->isEarly) {
-                    // Instantly write "100 Continue" payloads in correct sequence
-                    if (\is_string($head->data)) {
-                        $connection->write($head->data);
-                    }
-                    $onComplete();
-                } else {
-                    if ($head->response instanceof Response && ! $protocolHandler->isUpgraded()) {
-                        try {
-                            $protocolHandler->writeResponse($head->response, $onComplete);
-                        } catch (\Throwable $e) {
-                            try {
-                                $errorResponse = Response::plaintext("500 Internal Server Error\n" . $e->getMessage(), 500);
-                                $protocolHandler->writeResponse($errorResponse, $onComplete);
-                            } catch (\Throwable) {
-                                $connection->close();
-                                $onComplete();
-                            }
-                        }
-                    } else {
-                        // Drop safely if response is null (Connection Upgraded)
-                        $protocolHandler->decrementActiveRequests();
-                        $onComplete();
-                    }
-                }
-            };
-
-            $protocolHandler = new Http11ProtocolHandler($connection, function (Request $request, ProtocolHandlerInterface $protocol) use ($requestHandler, &$pipelineQueue, &$flushQueue, $maxPipelineDepth, $connection) {
-
-                $placeholder = new \stdClass();
-                $placeholder->isEarly = false;
-                $placeholder->response = null;
-                $placeholder->isReady = false;
-
-                $pipelineQueue[] = $placeholder;
-
-                // Backpressure: Prevent 1000 fast requests behind 1 slow request
-                if (\count($pipelineQueue) >= $maxPipelineDepth) {
-                    $connection->pause();
-                }
-
-                $fiber = new \Fiber(function () use ($requestHandler, $request, $protocol, $placeholder, &$flushQueue) {
-                    try {
-                        $response = $requestHandler($request, $protocol);
-
-                        if ($protocol->isUpgraded()) {
-                            $placeholder->response = null;
-                            $placeholder->isReady = true;
-                        } elseif (! $response instanceof Response) {
-                            throw new InvalidResponseException('Request handler must return an instance of Response');
-                        } else {
-                            $placeholder->response = $response;
-                            $placeholder->isReady = true;
-                        }
-                    } catch (\Throwable $e) {
-                        try {
-                            if (! $protocol->isUpgraded()) {
-                                $placeholder->response = Response::plaintext("500 Internal Server Error\n" . $e->getMessage(), 500);
-                                $placeholder->isReady = true;
-                            } else {
-                                $placeholder->response = null;
-                                $placeholder->isReady = true;
-                            }
-                        } catch (\Throwable) {
-                            $protocol->getConnection()->close();
-
-                            return;
-                        }
-                    }
-
-                    if ($flushQueue !== null) { // @phpstan-ignore notIdentical.alwaysTrue
-                        $flushQueue();
-                    }
-                });
-                Loop::addFiber($fiber);
-            }, $maxBodySize, $streamingRequests, $maxHeaderSize, $maxHeaderCount, $headerTimeout, $keepAliveTimeout);
-
-            $protocolHandler->onEarlyResponse = static function (string $data) use (&$pipelineQueue, &$flushQueue, $maxPipelineDepth, $connection) {
-                $placeholder = new \stdClass();
-                $placeholder->isEarly = true;
-                $placeholder->data = $data;
-                $placeholder->isReady = true;
-                $placeholder->response = null;
-
-                $pipelineQueue[] = $placeholder;
-
-                if (\count($pipelineQueue) >= $maxPipelineDepth) {
-                    $connection->pause();
-                }
-
-                if ($flushQueue !== null) { // @phpstan-ignore notIdentical.alwaysTrue
-                    $flushQueue();
-                }
-            };
-
-            $handlerId = spl_object_id($protocolHandler);
-            $activeHandlers[$handlerId] = $protocolHandler;
-
-            $connection->on('close', static function () use ($handlerId, &$activeHandlers, &$pipelineQueue, &$flushQueue, &$protocolHandler) {
-                unset($activeHandlers[$handlerId]);
-                $pipelineQueue = [];
-                $flushQueue = null;
-                $protocolHandler = null;
+            $connection->on('close', static function () use ($managerId, &$activeManagers): void {
+                unset($activeManagers[$managerId]);
             });
 
-            $connection->on('data', static function (string $data) use (&$protocolHandler) {
-                if ($protocolHandler !== null) {
-                    $protocolHandler->handleData($data);
-                }
-            });
+            $manager->handle($connection);
         });
 
-        return static function () use (&$activeHandlers): int {
+        return static function () use (&$activeManagers): int {
             $count = 0;
 
-            foreach ($activeHandlers as $handler) {
-                if ($handler->isUpgraded()) {
+            foreach ($activeManagers as $manager) {
+                if ($manager->isUpgraded()) {
                     continue;
                 }
 
-                $handler->gracefulShutdown();
-                $count += $handler->getActiveRequestsCount();
+                $manager->gracefulShutdown();
+                $count += $manager->getActiveRequestsCount();
             }
 
             return $count;
