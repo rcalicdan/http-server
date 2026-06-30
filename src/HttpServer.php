@@ -500,14 +500,13 @@ final class HttpServer implements HttpServerInterface
             ));
         };
 
-        $pool = new ProcessPool(size: $workers)
-            ->withoutTimeout()
+       $pool = new ProcessPool(size: $workers)
             ->onMessage(function (WorkerMessage $message) {
                 $data = $message->data;
                 if (
-                    \is_array($data)
-                    && ($data['type'] ?? '') === 'log'
-                    && \is_string($data['message'] ?? null)
+                    \is_array($data) 
+                    && ($data['type'] ?? '') === 'log' 
+                    && \is_string($data['message'] ?? null) 
                 ) {
                     $this->log("[Worker {$message->pid}] {$data['message']}");
                 }
@@ -660,8 +659,7 @@ final class HttpServer implements HttpServerInterface
                 }
 
                 $handler->gracefulShutdown();
-
-                $count += $handler->getActiveRequestCount();
+                $count++;
             }
 
             return $count;
