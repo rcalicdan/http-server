@@ -29,6 +29,14 @@ use Hibla\Socket\Interfaces\ConnectionInterface;
  *   STATE_CHUNK_TRAILER → Consume the optional trailer section after the terminal chunk.
  *   STATE_UPGRADED      → Connection has been handed off or closed; all input is discarded.
  *
+ * ─── Pipelining & Concurrency ────────────────────────────────────────────────────
+ *
+ * Fully supports HTTP/1.1 pipelining with concurrent backend processing.
+ * Requests pipelined in a single TCP payload are parsed sequentially and dispatched
+ * as separate Fibers instantly. Responses generated out-of-order by faster Fibers
+ * are held in a FIFO queue and flushed to the wire strictly in the original request
+ * arrival sequence to comply with RFC 9112 Section 9.3.
+ *
  * ─── Message Framing ─────────────────────────────────────────────────────────────
  *
  * Parses the request-line and header fields. Enforces the token rule on field names,
@@ -120,7 +128,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
     private bool $willCloseConnection = false;
 
-    private bool $isProcessingRequest = false;
+    private int $activeRequestCount = 0;
 
     private int $state = self::STATE_HEADERS;
 
@@ -147,6 +155,17 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     private ?string $headerTimerId = null;
 
     private ?string $keepAliveTimerId = null;
+
+    private int $nextRequestSequence = 0;
+
+    private int $nextResponseSequence = 0;
+
+    /**
+     * @var array<int, \Closure>
+     */
+    private array $pendingResponses = [];
+
+    private bool $isWritingResponse = false;
 
     /**
      * @var list<string>
@@ -249,159 +268,215 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     }
 
     /**
-     * Writes an HTTP response back to the underlying connection.
+     * Fallback for direct unsequenced write calls (e.g. from global exception handlers).
+     * Automatically assigns a sequence ID at the end of the queue.
+     *
+     * @inheritDoc
+     */
+    public function writeResponse(Response $response): void
+    {
+        $this->writeResponseWithSequence($this->nextRequestSequence++, '', $response);
+    }
+
+    /**
+     * Writes an HTTP response back to the underlying connection in strict FIFO order.
+     * Responses generated out-of-order by concurrent Fibers are queued and flushed sequentially.
      *
      * Applies the following RFC 9112 connection persistence rules:
      * - section 9.3: The response status line must mirror the request's protocol version.
      * - section 9.3: HTTP/1.0 connections are non-persistent by default; closed unless keep-alive is requested.
      * - section 9.6: A response carrying Connection: close triggers immediate connection teardown.
      *
-     * @param Response $response
-     *
-     * @inheritDoc
+     * @internal
      */
-    public function writeResponse(Response $response): void
+    public function writeResponseWithSequence(int $sequenceId, string $requestMethod, Response $response): void
     {
-        // RFC 9931 section 8: a rejected CONNECT MUST force connection closure to prevent
-        // optimistically-pipelined data from being parsed as subsequent HTTP requests.
-        if (
-            $this->currentRequest !== null
-            && $this->currentRequest->getMethod() === 'CONNECT'
-            && $response->getStatusCode() >= 400
-        ) {
-            $this->willCloseConnection = true;
-        }
-
-        $body = $response->getBody();
-        $isStreamingOut = ! \is_string($body);
-        $version = $response->getProtocolVersion() === '1.1' ? $this->activeResponseVersion : $response->getProtocolVersion();
-        $headers = $response->getHeaders();
-
-        if (! isset($headers['server'])) {
-            $headers['server'] = ['Hibla/1.0'];
-        }
-
-        $isChunkedResponse = false;
-
-        if ($isStreamingOut && ! isset($headers['content-length'])) {
-            $isChunkedResponse = true;
-            $headers['transfer-encoding'] = ['chunked'];
-        } elseif (! $isStreamingOut && ! isset($headers['content-length']) && $response->getStatusCode() !== 101) {
-            $headers['content-length'] = [(string) \strlen((string) $body)];
-        }
-
-        $shouldClose = $this->willCloseConnection || strtolower($response->getHeaderLine('connection')) === 'close';
-
-        if ($shouldClose) {
-            $headers['connection'] = ['close'];
-        } elseif ($version === '1.0' && ! isset($headers['connection'])) {
-            $headers['connection'] = ['keep-alive'];
-        }
-
-        $lines = ["HTTP/{$version} {$response->getStatusCode()} {$response->getReasonPhrase()}"];
-
-        foreach ($headers as $name => $values) {
-            $displayName = self::formatHeaderNameForWire($name);
-            foreach ((array) $values as $value) {
-                $strValue = (string) $value;
-
-                // SECURITY BOUNDARY: Throw if the application outputs unsafe control characters.
-                // Prevents HTTP Response Splitting and Alerts the developer.
-                if (preg_match('/[\r\n\0]/', $strValue) === 1) {
-                    throw new \Hibla\HttpServer\Exceptions\InvalidResponseException(
-                        "Header value for '{$name}' contains invalid control characters (CR, LF, or NUL)"
-                    );
+        $task = function (callable $onComplete) use ($requestMethod, $response) {
+            $completed = false;
+            $safeOnComplete = function () use (&$completed, $onComplete) {
+                if (! $completed) {
+                    $completed = true;
+                    $onComplete();
                 }
+            };
 
-                $lines[] = "{$displayName}: {$strValue}";
+            // RFC 9931 section 8: a rejected CONNECT MUST force connection closure to prevent
+            // optimistically-pipelined data from being parsed as subsequent HTTP requests.
+            if ($requestMethod === 'CONNECT' && $response->getStatusCode() >= 400) {
+                $this->willCloseConnection = true;
             }
-        }
 
-        $headerBlock = implode("\r\n", $lines) . "\r\n\r\n";
+            $body = $response->getBody();
+            $isStreamingOut = ! \is_string($body);
+            $version = $response->getProtocolVersion() === '1.1' ? $this->activeResponseVersion : $response->getProtocolVersion();
+            $headers = $response->getHeaders();
 
-        if (\is_string($body)) {
+            if (! isset($headers['server'])) {
+                $headers['server'] = ['Hibla/1.0'];
+            }
+
+            $isChunkedResponse = false;
+
+            if ($isStreamingOut && ! isset($headers['content-length'])) {
+                $isChunkedResponse = true;
+                $headers['transfer-encoding'] = ['chunked'];
+            } elseif (! $isStreamingOut && ! isset($headers['content-length']) && $response->getStatusCode() !== 101) {
+                $headers['content-length'] = [(string) \strlen((string) $body)];
+            }
+
+            $shouldClose = $this->willCloseConnection || strtolower($response->getHeaderLine('connection')) === 'close';
+
             if ($shouldClose) {
-                $this->connection->end($headerBlock . $body);
-                $this->state = self::STATE_UPGRADED;
-            } else {
-                $this->connection->write($headerBlock . $body);
-                $this->handleKeepAliveState();
+                $headers['connection'] = ['close'];
+            } elseif ($version === '1.0' && ! isset($headers['connection'])) {
+                $headers['connection'] = ['keep-alive'];
             }
-            $this->isProcessingRequest = false;
-        } else {
-            if (! $body->isReadable()) {
-                $finalPayload = $headerBlock;
-                if ($isChunkedResponse) {
-                    $finalPayload .= "0\r\n\r\n";
-                }
 
+            $lines = ["HTTP/{$version} {$response->getStatusCode()} {$response->getReasonPhrase()}"];
+
+            foreach ($headers as $name => $values) {
+                $displayName = self::formatHeaderNameForWire($name);
+                foreach ((array) $values as $value) {
+                    $strValue = (string) $value;
+
+                    // SECURITY BOUNDARY: Throw if the application outputs unsafe control characters.
+                    // Prevents HTTP Response Splitting and Alerts the developer.
+                    if (preg_match('/[\r\n\0]/', $strValue) === 1) {
+                        throw new \Hibla\HttpServer\Exceptions\InvalidResponseException(
+                            "Header value for '{$name}' contains invalid control characters (CR, LF, or NUL)"
+                        );
+                    }
+
+                    $lines[] = "{$displayName}: {$strValue}";
+                }
+            }
+
+            $headerBlock = implode("\r\n", $lines) . "\r\n\r\n";
+
+            if (\is_string($body)) {
                 if ($shouldClose) {
-                    $this->connection->end($finalPayload);
+                    $this->connection->end($headerBlock . $body);
                     $this->state = self::STATE_UPGRADED;
                 } else {
-                    $this->connection->write($finalPayload);
+                    $this->connection->write($headerBlock . $body);
                     $this->handleKeepAliveState();
                 }
-                $this->isProcessingRequest = false;
+                $safeOnComplete();
+            } else {
+                if (! $body->isReadable()) {
+                    $finalPayload = $headerBlock;
+                    if ($isChunkedResponse) {
+                        $finalPayload .= "0\r\n\r\n";
+                    }
 
-                return;
-            }
-
-            $this->connection->write($headerBlock);
-
-            $connectionCloseListener = $body->close(...);
-
-            $this->connection->on('close', $connectionCloseListener);
-
-            $drainListener = $body->resume(...);
-            $this->connection->on('drain', $drainListener);
-
-            $body->on('data', function (string $chunk) use ($isChunkedResponse, $body) {
-                if ($isChunkedResponse) {
-                    $canContinue = $this->connection->write(dechex(\strlen($chunk)) . "\r\n" . $chunk . "\r\n");
-                } else {
-                    $canContinue = $this->connection->write($chunk);
-                }
-
-                if ($canContinue === false) {
-                    $body->pause();
-                }
-            });
-
-            $body->on('end', function () use ($isChunkedResponse, $shouldClose, $connectionCloseListener, $drainListener) {
-                $this->connection->removeListener('close', $connectionCloseListener);
-                $this->connection->removeListener('drain', $drainListener);
-
-                $finalChunk = $isChunkedResponse ? "0\r\n\r\n" : '';
-
-                if ($shouldClose || $this->willCloseConnection) {
-                    if ($finalChunk !== '') {
-                        $this->connection->end($finalChunk);
+                    if ($shouldClose) {
+                        $this->connection->end($finalPayload);
+                        $this->state = self::STATE_UPGRADED;
                     } else {
-                        $this->connection->end();
+                        $this->connection->write($finalPayload);
+                        $this->handleKeepAliveState();
                     }
-                    $this->state = self::STATE_UPGRADED;
-                } else {
-                    if ($finalChunk !== '') {
-                        $this->connection->write($finalChunk);
-                    }
-                    $this->handleKeepAliveState();
+                    $safeOnComplete();
+
+                    return;
                 }
-                $this->isProcessingRequest = false;
+
+                $this->connection->write($headerBlock);
+
+                $connectionCloseListener = $body->close(...);
+                $this->connection->on('close', $connectionCloseListener);
+
+                $drainListener = $body->resume(...);
+                $this->connection->on('drain', $drainListener);
+
+                $body->on('data', function (string $chunk) use ($isChunkedResponse, $body) {
+                    if ($isChunkedResponse) {
+                        $canContinue = $this->connection->write(dechex(\strlen($chunk)) . "\r\n" . $chunk . "\r\n");
+                    } else {
+                        $canContinue = $this->connection->write($chunk);
+                    }
+
+                    if ($canContinue === false) {
+                        $body->pause();
+                    }
+                });
+
+                $body->on('end', function () use ($isChunkedResponse, $shouldClose, $connectionCloseListener, $drainListener, $safeOnComplete) {
+                    $this->connection->removeListener('close', $connectionCloseListener);
+                    $this->connection->removeListener('drain', $drainListener);
+
+                    $finalChunk = $isChunkedResponse ? "0\r\n\r\n" : '';
+
+                    if ($shouldClose || $this->willCloseConnection) {
+                        if ($finalChunk !== '') {
+                            $this->connection->end($finalChunk);
+                        } else {
+                            $this->connection->end();
+                        }
+                        $this->state = self::STATE_UPGRADED;
+                    } else {
+                        if ($finalChunk !== '') {
+                            $this->connection->write($finalChunk);
+                        }
+                        $this->handleKeepAliveState();
+                    }
+                    $safeOnComplete();
+                });
+
+                $body->on('error', function () use ($connectionCloseListener, $safeOnComplete) {
+                    $this->connection->removeListener('close', $connectionCloseListener);
+                    $this->connection->close();
+                    $safeOnComplete();
+                });
+
+                $body->on('close', function () use ($connectionCloseListener, $safeOnComplete) {
+                    $this->connection->removeListener('close', $connectionCloseListener);
+                    $safeOnComplete();
+                });
+
+                $body->resume();
+            }
+        };
+
+        $this->pendingResponses[$sequenceId] = $task;
+        $this->flushResponseQueue();
+    }
+
+    /**
+     * Sequentially execute pending response writes in FIFO order.
+     */
+    private function flushResponseQueue(): void
+    {
+        if ($this->isWritingResponse) {
+            return;
+        }
+
+        while (isset($this->pendingResponses[$this->nextResponseSequence])) {
+            $this->isWritingResponse = true;
+            $task = $this->pendingResponses[$this->nextResponseSequence];
+            unset($this->pendingResponses[$this->nextResponseSequence]);
+
+            $task(function () {
+                $this->isWritingResponse = false;
+                $this->nextResponseSequence++;
+                $this->activeRequestCount--;
+
+                // If shutting down and no active requests remain, close immediately
+                if ($this->willCloseConnection && $this->activeRequestCount === 0) {
+                    $this->cancelAllTimers();
+                    $this->connection->close();
+                    $this->state = self::STATE_UPGRADED;
+
+                    return;
+                }
+
+                $this->flushResponseQueue();
             });
 
-            $body->on('error', function () use ($connectionCloseListener) {
-                $this->connection->removeListener('close', $connectionCloseListener);
-                $this->connection->close();
-                $this->isProcessingRequest = false;
-            });
-
-            $body->on('close', function () use ($connectionCloseListener) {
-                $this->connection->removeListener('close', $connectionCloseListener);
-                $this->isProcessingRequest = false;
-            });
-
-            $body->resume();
+            // If the task was asynchronous (streaming body), break and wait for onComplete
+            if ($this->isWritingResponse) {
+                break;
+            }
         }
     }
 
@@ -444,8 +519,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         // is also treated as idle: it have no parsed request to respond to, so
         // willCloseConnection cannot help it and only headerTimeout or reverse proxies would eventually
         // close it. During shutdown the server close it immediately instead.
-        $isIdle = !$this->isProcessingRequest
-            && $this->state === self::STATE_HEADERS;
+        $isIdle = $this->activeRequestCount === 0 && $this->state === self::STATE_HEADERS;
 
         // If it is idle, it is safe to close the connection immediately.
         if ($isIdle) {
@@ -461,6 +535,14 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     public function isUpgraded(): bool
     {
         return $this->state === self::STATE_UPGRADED;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function getActiveRequestCount(): int
+    {
+        return $this->activeRequestCount;
     }
 
     /**
@@ -561,9 +643,12 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             $this->bodyStream->on('resume', $this->connection->resume(...));
             $this->currentRequest->setBody($this->bodyStream);
 
-            $this->isProcessingRequest = true;
+            $this->activeRequestCount++;
+            $sequenceId = $this->nextRequestSequence++;
+
             if (\is_callable($this->onRequest)) {
-                ($this->onRequest)($this->currentRequest, $this);
+                $proxy = new Http11ProtocolHandlerProxy($this, $sequenceId, $this->currentRequest->getMethod());
+                ($this->onRequest)($this->currentRequest, $proxy);
             }
         }
 
@@ -830,9 +915,12 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
         } else {
             $this->currentRequest->setBody(implode('', $this->bodyChunks));
 
-            $this->isProcessingRequest = true;
+            $this->activeRequestCount++;
+            $sequenceId = $this->nextRequestSequence++;
+
             if (\is_callable($this->onRequest)) {
-                ($this->onRequest)($this->currentRequest, $this);
+                $proxy = new Http11ProtocolHandlerProxy($this, $sequenceId, $this->currentRequest->getMethod());
+                ($this->onRequest)($this->currentRequest, $proxy);
             }
         }
 

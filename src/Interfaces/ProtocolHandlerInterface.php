@@ -40,4 +40,11 @@ interface ProtocolHandlerInterface
      * Checks if the protocol handler has detached and upgraded the connection.
      */
     public function isUpgraded(): bool;
+
+    /**
+     * Retrieves the current number of active (unfulfilled) requests on this connection.
+     *
+     * Useful for graceful shutdown draining and concurrency monitoring.
+     */
+    public function getActiveRequestCount(): int;
 }
