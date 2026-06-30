@@ -20,22 +20,25 @@ function getServerProperty(HttpServer $server, string $property): mixed
 
 function mockConnection(
     string &$buffer,
+    bool $expectClose = false,
     ?callable &$onData = null,
     ?int &$pauseCount = null,
     ?int &$resumeCount = null
 ): ConnectionInterface {
     $connection = Mockery::mock(ConnectionInterface::class);
     $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
-    $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$buffer) {
+
+    $connection->shouldReceive('write')->zeroOrMoreTimes()->andReturnUsing(function (string $data) use (&$buffer) {
         $buffer .= $data;
 
         return true;
     });
 
-    $connection->shouldReceive('end')->andReturnUsing(function (?string $data = null) use (&$buffer) {
+    $connection->shouldReceive('end')->zeroOrMoreTimes()->andReturnUsing(function (?string $data = null) use (&$buffer, $connection) {
         if ($data !== null) {
             $buffer .= $data;
         }
+        $connection->close();
     });
 
     $closeListeners = [];
@@ -49,7 +52,14 @@ function mockConnection(
         }
     });
 
-    $connection->shouldReceive('close')->zeroOrMoreTimes()->andReturnUsing(function () use (&$closeListeners) {
+    $closeExpectation = $connection->shouldReceive('close');
+    if ($expectClose) {
+        $closeExpectation->atLeast()->once();
+    } else {
+        $closeExpectation->zeroOrMoreTimes();
+    }
+
+    $closeExpectation->andReturnUsing(function () use (&$closeListeners) {
         foreach ($closeListeners as $listener) {
             $listener();
         }
