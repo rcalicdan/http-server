@@ -405,7 +405,10 @@ final class HttpServer implements HttpServerInterface
             $this->maxBodySize,
             $this->streamingRequests,
             $this->maxHeaderSize,
-            $this->maxHeaderCount
+            $this->maxHeaderCount,
+            $this->headerTimeout,
+            $this->keepAliveTimeout,
+            $this->maxConcurrentRequestsPerConnection
         );
 
         $this->setupSignalHandlers(function () use ($triggerShutdown) {
@@ -449,7 +452,10 @@ final class HttpServer implements HttpServerInterface
             $this->maxBodySize,
             $this->streamingRequests,
             $this->maxHeaderSize,
-            $this->maxHeaderCount
+            $this->maxHeaderCount,
+            $this->headerTimeout,
+            $this->keepAliveTimeout,
+            $this->maxConcurrentRequestsPerConnection
         );
 
         $this->setupSignalHandlers(function () use ($socket, $triggerShutdown) {
@@ -495,7 +501,8 @@ final class HttpServer implements HttpServerInterface
             $this->headerTimeout,
             $this->keepAliveTimeout,
             $this->onStartCallback,
-            $this->gracefulShutdownTimeout
+            $this->gracefulShutdownTimeout,
+            $this->maxConcurrentRequestsPerConnection,
         );
 
         $isShuttingDown = false;
