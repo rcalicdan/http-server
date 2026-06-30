@@ -18,7 +18,8 @@ describe('Protocol-level Graceful Shutdown', function () {
             $wasClosed = true;
         });
 
-        $handler = new Http11ProtocolHandler($connection, function () {});
+        $handler = new Http11ProtocolHandler($connection, function () {
+        });
 
         $handler->gracefulShutdown();
 
@@ -80,7 +81,8 @@ describe('Protocol-level Graceful Shutdown', function () {
             $wasClosed = true;
         });
 
-        $handler = new Http11ProtocolHandler($connection, function () {});
+        $handler = new Http11ProtocolHandler($connection, function () {
+        });
 
         $handler->gracefulShutdown();
         $handler->gracefulShutdown();
@@ -98,7 +100,8 @@ describe('Protocol-level Graceful Shutdown', function () {
             $wasClosed = true;
         });
 
-        $handler = new Http11ProtocolHandler($connection, function () {});
+        $handler = new Http11ProtocolHandler($connection, function () {
+        });
 
         $handler->detach();
 
@@ -123,7 +126,8 @@ describe('Protocol-level Graceful Shutdown', function () {
         $handler->writeResponse(new Response(200, ['Connection' => 'keep-alive'], 'OK'));
 
         expect($buffer)->toContain('Connection: close')
-            ->and($buffer)->not->toContain('Connection: keep-alive');
+            ->and($buffer)->not->toContain('Connection: keep-alive')
+        ;
     });
 
     it('allows an active request body stream (upload) to complete before closing on shutdown', function () {
@@ -140,12 +144,12 @@ describe('Protocol-level Graceful Shutdown', function () {
         });
 
         $handler->handleData("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n");
-        $handler->handleData("12345");
+        $handler->handleData('12345');
 
         $handler->gracefulShutdown();
         expect($wasClosed)->toBeFalse();
 
-        $handler->handleData("67890");
+        $handler->handleData('67890');
 
         expect($wasClosed)->toBeTrue();
         expect($buffer)->toContain('Upload received');
@@ -181,6 +185,7 @@ describe('Protocol-level Graceful Shutdown', function () {
         expect($wasClosed)->toBeTrue();
         expect($buffer)->toContain("chunk1\n")
             ->and($buffer)->toContain("chunk2\n")
-            ->and($buffer)->toContain("0\r\n\r\n");
+            ->and($buffer)->toContain("0\r\n\r\n")
+        ;
     });
 });

@@ -58,6 +58,7 @@ function mockStreamingConnection(string &$buffer): ConnectionInterface
 
     $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$buffer) {
         $buffer .= $data;
+
         return true;
     });
 
@@ -98,6 +99,7 @@ function createCloseableMockConnection(string &$buffer): ConnectionInterface
 
     $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$buffer) {
         $buffer .= $data;
+
         return true;
     });
 

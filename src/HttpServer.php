@@ -13,7 +13,7 @@ use Hibla\HttpServer\Internals\ServerWorkerTask;
 use Hibla\HttpServer\Message\Request;
 use Hibla\HttpServer\Message\Response;
 use Hibla\HttpServer\Protocol\Http11ProtocolHandler;
-use Hibla\Parallel\Parallel;
+use Hibla\Parallel\ProcessPool;
 use Hibla\Parallel\ValueObjects\WorkerMessage;
 use Hibla\Socket\Interfaces\ConnectionInterface;
 use Hibla\Socket\Interfaces\ServerInterface;
@@ -500,10 +500,14 @@ final class HttpServer implements HttpServerInterface
             ));
         };
 
-        $pool = Parallel::pool(size: $workers)
+       $pool = new ProcessPool(size: $workers)
             ->onMessage(function (WorkerMessage $message) {
                 $data = $message->data;
-                if (\is_array($data) && ($data['type'] ?? '') === 'log') {
+                if (
+                    \is_array($data) 
+                    && ($data['type'] ?? '') === 'log' 
+                    && \is_string($data['message'] ?? null) 
+                ) {
                     $this->log("[Worker {$message->pid}] {$data['message']}");
                 }
             })
@@ -648,7 +652,12 @@ final class HttpServer implements HttpServerInterface
 
         return static function () use (&$activeHandlers): int {
             $count = 0;
+
             foreach ($activeHandlers as $handler) {
+                if ($handler->isUpgraded()) {
+                    continue;
+                }
+
                 $handler->gracefulShutdown();
                 $count++;
             }

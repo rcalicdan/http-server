@@ -13,7 +13,6 @@ use Hibla\Stream\ThroughStream;
 use function Hibla\await;
 use function Hibla\delay;
 
-
 describe('Server-level Graceful Draining', function () {
     it('gracefully drains in-flight requests on shutdown without cutting off clients', function () {
         $socket = new SocketServer('tcp://127.0.0.1:0');
@@ -94,9 +93,8 @@ describe('Server-level Graceful Draining', function () {
         $rawClient = new Connector();
         $connection = await($rawClient->connect(str_replace('http://', 'tcp://', $url)));
 
-
         $connection->write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        
+
         $responsePromise = new Promise(function ($resolve) use ($connection) {
             $buffer = '';
             $connection->on('data', function ($chunk) use (&$buffer, $resolve) {
@@ -108,15 +106,17 @@ describe('Server-level Graceful Draining', function () {
         });
 
         await($responsePromise);
-        
+
         $wasClosed = false;
         $connection->on('close', function () use (&$wasClosed) {
             $wasClosed = true;
         });
 
-        $activeCount = $triggerShutdown();
-        
+        $triggerShutdown();
+
         await(delay(0.05));
+
+        $activeCount = $triggerShutdown();
 
         expect($activeCount)->toBe(0);
         expect($wasClosed)->toBeTrue();
@@ -128,11 +128,12 @@ describe('Server-level Graceful Draining', function () {
         $socket = new SocketServer('tcp://127.0.0.1:0');
         $url = str_replace('tcp://', 'http://', $socket->getAddress());
 
-        $triggerShutdown = HttpServer::attachProtocolHandler($socket, function (\Hibla\HttpServer\Message\Request $request, \Hibla\HttpServer\Interfaces\ProtocolHandlerInterface $protocol) {
+        $triggerShutdown = HttpServer::attachProtocolHandler($socket, function (Hibla\HttpServer\Message\Request $request, Hibla\HttpServer\Interfaces\ProtocolHandlerInterface $protocol) {
             if ($request->getHeaderLine('Upgrade') === 'websocket') {
                 $protocol->writeResponse(new ServerResponse(101, ['Upgrade' => 'websocket', 'Connection' => 'Upgrade']));
-                $protocol->detach(); 
+                $protocol->detach();
             }
+
             return null;
         });
 
@@ -156,8 +157,10 @@ describe('Server-level Graceful Draining', function () {
             $wasClosed = true;
         });
 
-        $activeCount = $triggerShutdown();
+        $triggerShutdown();
         await(delay(0.05));
+
+        $activeCount = $triggerShutdown();
 
         expect($activeCount)->toBe(0);
         expect($wasClosed)->toBeFalse();

@@ -424,7 +424,7 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
     }
 
     /**
-     * Signals the protocol handler to gracefully shut down.
+     * {@inheritDoc}
      *
      * If the handler is currently processing a request, it will finish processing it,
      * append a "Connection: close" header to the response, and then close the socket.
@@ -440,9 +440,9 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
         $this->willCloseConnection = true;
 
-        // A connection is only truly idle if it's not being processed, it's waiting for headers, 
+        // A connection is only truly idle if it's not being processed, it's waiting for headers,
         // and there are no partial bytes sitting in the buffer (mid-upload).
-        $isIdle = !$this->isProcessingRequest
+        $isIdle = ! $this->isProcessingRequest
             && $this->state === self::STATE_HEADERS
             && $this->buffer === '';
 
@@ -452,6 +452,14 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
             $this->connection->close();
             $this->state = self::STATE_UPGRADED;
         }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function isUpgraded(): bool
+    {
+        return $this->state === self::STATE_UPGRADED;
     }
 
     /**
