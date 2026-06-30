@@ -6,6 +6,7 @@ use Hibla\HttpServer\Interfaces\ProtocolHandlerInterface;
 use Hibla\HttpServer\Message\Request;
 use Hibla\HttpServer\Message\Response;
 use Hibla\HttpServer\Protocol\Http11ProtocolHandler;
+use Hibla\Stream\ThroughStream;
 
 describe('Protocol-level Graceful Shutdown', function () {
     it('immediately closes the connection on graceful shutdown if idle', function () {
@@ -17,8 +18,7 @@ describe('Protocol-level Graceful Shutdown', function () {
             $wasClosed = true;
         });
 
-        $handler = new Http11ProtocolHandler($connection, function () {
-        });
+        $handler = new Http11ProtocolHandler($connection, function () {});
 
         $handler->gracefulShutdown();
 
@@ -80,8 +80,7 @@ describe('Protocol-level Graceful Shutdown', function () {
             $wasClosed = true;
         });
 
-        $handler = new Http11ProtocolHandler($connection, function () {
-        });
+        $handler = new Http11ProtocolHandler($connection, function () {});
 
         $handler->gracefulShutdown();
         $handler->gracefulShutdown();
@@ -99,8 +98,7 @@ describe('Protocol-level Graceful Shutdown', function () {
             $wasClosed = true;
         });
 
-        $handler = new Http11ProtocolHandler($connection, function () {
-        });
+        $handler = new Http11ProtocolHandler($connection, function () {});
 
         $handler->detach();
 
@@ -108,5 +106,81 @@ describe('Protocol-level Graceful Shutdown', function () {
 
         // The socket must not close because the HTTP protocol handler no longer owns it
         expect($wasClosed)->toBeFalse();
+    });
+
+    it('overrides an application-provided Connection: keep-alive header to close during shutdown', function () {
+        $buffer = '';
+        $connection = createCloseableMockConnection($buffer);
+
+        $handler = new Http11ProtocolHandler($connection, function (Request $request, ProtocolHandlerInterface $protocol) {
+            // Do nothing immediately. Simulate a slow async response.
+        });
+
+        $handler->handleData("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        $handler->gracefulShutdown();
+
+        $handler->writeResponse(new Response(200, ['Connection' => 'keep-alive'], 'OK'));
+
+        expect($buffer)->toContain('Connection: close')
+            ->and($buffer)->not->toContain('Connection: keep-alive');
+    });
+
+    it('allows an active request body stream (upload) to complete before closing on shutdown', function () {
+        $buffer = '';
+        $connection = createCloseableMockConnection($buffer);
+        $wasClosed = false;
+
+        $connection->on('close', function () use (&$wasClosed) {
+            $wasClosed = true;
+        });
+
+        $handler = new Http11ProtocolHandler($connection, function (Request $request, ProtocolHandlerInterface $protocol) {
+            $protocol->writeResponse(Response::plaintext('Upload received'));
+        });
+
+        $handler->handleData("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n");
+        $handler->handleData("12345");
+
+        $handler->gracefulShutdown();
+        expect($wasClosed)->toBeFalse();
+
+        $handler->handleData("67890");
+
+        expect($wasClosed)->toBeTrue();
+        expect($buffer)->toContain('Upload received');
+        expect($buffer)->toContain('Connection: close');
+    });
+
+    it('gracefully closes connection after a streaming response (download) completes if shutdown triggered mid-stream', function () {
+        $buffer = '';
+        $connection = mockStreamingConnection($buffer);
+        $wasClosed = false;
+
+        $connection->on('close', function () use (&$wasClosed) {
+            $wasClosed = true;
+        });
+
+        $stream = new ThroughStream();
+
+        $handler = new Http11ProtocolHandler($connection, function (Request $request, ProtocolHandlerInterface $protocol) use ($stream) {
+            $protocol->writeResponse(new Response(200, [], $stream));
+        });
+
+        $handler->handleData("GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        $stream->write("chunk1\n");
+
+        $handler->gracefulShutdown();
+
+        expect($wasClosed)->toBeFalse();
+
+        $stream->write("chunk2\n");
+        $stream->end();
+
+        expect($wasClosed)->toBeTrue();
+        expect($buffer)->toContain("chunk1\n")
+            ->and($buffer)->toContain("chunk2\n")
+            ->and($buffer)->toContain("0\r\n\r\n");
     });
 });

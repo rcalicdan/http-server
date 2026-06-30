@@ -58,18 +58,12 @@ function mockStreamingConnection(string &$buffer): ConnectionInterface
 
     $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$buffer) {
         $buffer .= $data;
-
         return true;
-    });
-
-    $connection->shouldReceive('end')->andReturnUsing(function (?string $data = null) use (&$buffer) {
-        if ($data !== null) {
-            $buffer .= $data;
-        }
     });
 
     $connection->shouldReceive('pause')->zeroOrMoreTimes();
     $connection->shouldReceive('resume')->zeroOrMoreTimes();
+    $connection->shouldReceive('removeListener')->zeroOrMoreTimes();
 
     $closeListeners = [];
 
@@ -79,10 +73,19 @@ function mockStreamingConnection(string &$buffer): ConnectionInterface
         }
     });
 
-    $connection->shouldReceive('close')->zeroOrMoreTimes()->andReturnUsing(function () use (&$closeListeners) {
+    $triggerClose = function () use (&$closeListeners) {
         foreach ($closeListeners as $listener) {
             $listener();
         }
+    };
+
+    $connection->shouldReceive('close')->zeroOrMoreTimes()->andReturnUsing($triggerClose);
+
+    $connection->shouldReceive('end')->andReturnUsing(function (?string $data = null) use (&$buffer, $triggerClose) {
+        if ($data !== null) {
+            $buffer .= $data;
+        }
+        $triggerClose();
     });
 
     return $connection;
@@ -92,6 +95,13 @@ function createCloseableMockConnection(string &$buffer): ConnectionInterface
 {
     $connection = Mockery::mock(ConnectionInterface::class);
     $connection->shouldReceive('getRemoteAddress')->andReturn('127.0.0.1');
+
+    $connection->shouldReceive('write')->andReturnUsing(function (string $data) use (&$buffer) {
+        $buffer .= $data;
+        return true;
+    });
+
+    $connection->shouldReceive('removeListener')->zeroOrMoreTimes();
 
     $closeListeners = [];
     $connection->shouldReceive('on')->zeroOrMoreTimes()->andReturnUsing(function (string $event, callable $listener) use (&$closeListeners) {
@@ -117,7 +127,6 @@ function createCloseableMockConnection(string &$buffer): ConnectionInterface
 
     return $connection;
 }
-
 /**
  * @return array{0: SocketServer, 1: string}
  */

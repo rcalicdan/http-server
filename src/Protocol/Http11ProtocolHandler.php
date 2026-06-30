@@ -292,9 +292,9 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
         $shouldClose = $this->willCloseConnection || strtolower($response->getHeaderLine('connection')) === 'close';
 
-        if ($shouldClose && ! isset($headers['connection'])) {
+        if ($shouldClose) {
             $headers['connection'] = ['close'];
-        } elseif (! $shouldClose && $version === '1.0' && ! isset($headers['connection'])) {
+        } elseif ($version === '1.0' && ! isset($headers['connection'])) {
             $headers['connection'] = ['keep-alive'];
         }
 
@@ -440,8 +440,14 @@ class Http11ProtocolHandler implements ProtocolHandlerInterface
 
         $this->willCloseConnection = true;
 
-        // If no request is currently being processed, it is safe to close the connection immediately.
-        if (! $this->isProcessingRequest) {
+        // A connection is only truly idle if it's not being processed, it's waiting for headers, 
+        // and there are no partial bytes sitting in the buffer (mid-upload).
+        $isIdle = !$this->isProcessingRequest
+            && $this->state === self::STATE_HEADERS
+            && $this->buffer === '';
+
+        // If it is idle, it is safe to close the connection immediately.
+        if ($isIdle) {
             $this->cancelAllTimers();
             $this->connection->close();
             $this->state = self::STATE_UPGRADED;
