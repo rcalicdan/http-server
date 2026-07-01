@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Hibla\EventLoop\Loop;
+use Hibla\HttpServer\Interfaces\ProtocolHandlerInterface;
 use Hibla\HttpServer\Internals\Http11ConnectionManager;
 use Hibla\HttpServer\Message\Request;
 use Hibla\HttpServer\Message\Response;
@@ -16,7 +17,7 @@ afterEach(function () {
     Mockery::close();
 });
 
-describe('HTTP/1.1 Pipelining (RFC 9112 §9.3) Compliance', function () {
+describe('HTTP/1.1 Pipelining (RFC 9112 section 9.3) Compliance', function () {
 
     it('enforces strict FIFO response ordering even if later requests finish faster', function () {
         $buffer = '';
@@ -87,8 +88,6 @@ describe('HTTP/1.1 Pipelining (RFC 9112 §9.3) Compliance', function () {
 
         expect($onData)->not->toBeNull();
 
-        debug('Sending 3 pipelined requests with limit = 2...');
-
         $onData(
             "GET /req1 HTTP/1.1\r\nHost: localhost\r\n\r\n" .
             "GET /req2 HTTP/1.1\r\nHost: localhost\r\n\r\n" .
@@ -99,7 +98,6 @@ describe('HTTP/1.1 Pipelining (RFC 9112 §9.3) Compliance', function () {
 
         expect($pauseCount)->toBe(2);
 
-        debug('Resolving /req1...');
         $deferreds['/req1'](Response::plaintext('Response 1'));
         await(delay(0.01));
 
@@ -146,5 +144,117 @@ describe('HTTP/1.1 Pipelining (RFC 9112 §9.3) Compliance', function () {
         $cleanPos = strpos($buffer, 'Clean Response');
 
         expect($errPos)->toBeLessThan($cleanPos);
+    });
+
+    it('halts pipelined execution immediately if a request triggers a protocol upgrade (101)', function () {
+        $buffer = '';
+        $onData = null;
+        $connection = mockConnection($buffer, onData: $onData);
+
+        $processedRequests = [];
+
+        $manager = new Http11ConnectionManager(
+            function (Request $request, ProtocolHandlerInterface $protocol) use (&$processedRequests) {
+                $processedRequests[] = $request->getUri();
+
+                if ($request->getUri() === '/upgrade') {
+                    $protocol->writeResponse(new Response(101, ['Upgrade' => 'websocket', 'Connection' => 'Upgrade']));
+                    $protocol->detach();
+
+                    return null;
+                }
+
+                return Response::plaintext('Handled: ' . $request->getUri());
+            }
+        );
+
+        $manager->handle($connection);
+
+        expect($onData)->not->toBeNull();
+
+        $onData(
+            "GET /normal HTTP/1.1\r\nHost: localhost\r\n\r\n" .
+            "GET /upgrade HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        );
+
+        await(delay(0.01));
+
+        $onData("GET /smuggled HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        await(delay(0.01));
+
+        expect($processedRequests)->toBe(['/normal', '/upgrade'])
+            ->and($buffer)->toContain('Handled: /normal')
+            ->and($buffer)->toContain('101 Switching Protocols')
+            ->and($buffer)->not->toContain('Handled: /smuggled')
+        ;
+    });
+
+    it('aborts queued pipeline tasks safely if the client disconnects', function () {
+        $buffer = '';
+        $onData = null;
+        $connection = mockConnection($buffer, onData: $onData);
+
+        $manager = new Http11ConnectionManager(
+            function (Request $request) {
+                if ($request->getUri() === '/hanging') {
+                    await(delay(0.05));
+
+                    return Response::plaintext('Aborted Response');
+                }
+
+                return Response::plaintext('Clean');
+            }
+        );
+
+        $manager->handle($connection);
+
+        expect($onData)->not->toBeNull();
+
+        $onData(
+            "GET /hanging HTTP/1.1\r\nHost: localhost\r\n\r\n" .
+            "GET /clean HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+
+        await(delay(0.01));
+
+        $connection->close();
+
+        await(delay(0.06));
+
+        expect($buffer)->not->toContain('Aborted Response');
+    });
+
+    it('pauses the connection immediately after the first request if maxConcurrentRequests is set to 1', function () {
+        $buffer = '';
+        $onData = null;
+        $pauseCount = 0;
+        $resumeCount = 0;
+
+        $connection = mockConnection(
+            buffer: $buffer,
+            onData: $onData,
+            pauseCount: $pauseCount,
+            resumeCount: $resumeCount
+        );
+
+        $manager = new Http11ConnectionManager(
+            function (Request $request) {
+                await(delay(0.02));
+
+                return Response::plaintext('Done');
+            },
+            maxConcurrentRequestsPerConnection: 1
+        );
+
+        $manager->handle($connection);
+
+        expect($onData)->not->toBeNull();
+
+        $onData("GET /req1 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        await(delay(0.01));
+
+        expect($pauseCount)->toBe(1);
     });
 });
