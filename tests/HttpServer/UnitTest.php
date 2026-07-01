@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Hibla\HttpServer\ClusterOptions;
 use Hibla\HttpServer\Exceptions\InvalidConfigurationException;
 use Hibla\HttpServer\HttpServer;
 use Hibla\Socket\Interfaces\ServerInterface;
@@ -12,6 +13,7 @@ describe('HttpServer Configuration & Instantiation', function () {
         $server = HttpServer::create();
 
         expect(getServerProperty($server, 'uri'))->toBe('tcp://0.0.0.0:8000')
+            ->and($server)->toBeInstanceOf(HttpServer::class)
             ->and(getServerProperty($server, 'clusterEnabled'))->toBeFalse()
             ->and(getServerProperty($server, 'loggingEnabled'))->toBeTrue()
         ;
@@ -19,13 +21,11 @@ describe('HttpServer Configuration & Instantiation', function () {
 
     it('normalizes integer ports to a tcp uri', function () {
         $server = HttpServer::create(8080);
-
         expect(getServerProperty($server, 'uri'))->toBe('tcp://0.0.0.0:8080');
     });
 
     it('preserves an explicit uri scheme', function () {
         $server = HttpServer::create('unix:///var/run/app.sock');
-
         expect(getServerProperty($server, 'uri'))->toBe('unix:///var/run/app.sock');
     });
 
@@ -40,10 +40,7 @@ describe('HttpServer Configuration & Instantiation', function () {
     });
 
     it('configures raw socket context options', function () {
-        $server = HttpServer::create()->withContext([
-            'tcp' => ['backlog' => 511],
-        ]);
-
+        $server = HttpServer::create()->withContext(['tcp' => ['backlog' => 511]]);
         $context = getServerProperty($server, 'context');
         expect($context)->toHaveKey('tcp')
             ->and($context['tcp'])->toHaveKey('backlog', 511)
@@ -51,10 +48,7 @@ describe('HttpServer Configuration & Instantiation', function () {
     });
 
     it('configures tls and rewrites the uri scheme', function () {
-        $server = HttpServer::create('127.0.0.1:443')->withTls([
-            'local_cert' => '/path/to/cert.pem',
-        ]);
-
+        $server = HttpServer::create('127.0.0.1:443')->withTls(['local_cert' => '/path/to/cert.pem']);
         $context = getServerProperty($server, 'context');
         expect(getServerProperty($server, 'uri'))->toBe('tls://127.0.0.1:443')
             ->and($context)->toHaveKey('tls')
@@ -95,21 +89,24 @@ describe('HttpServer Configuration & Instantiation', function () {
 
         expect(getServerProperty($server, 'clusterEnabled'))->toBeFalse()
             ->and(getServerProperty($server, 'workerCount'))->toBe(1)
+            ->and(getServerProperty($server, 'clusterOptions'))->toBeNull()
         ;
     });
 
-    it('can configure worker memory limits', function () {
-        $server = HttpServer::create()->withWorkerMemoryLimit('256M');
+    it('can configure worker memory limits in cluster options', function () {
+        $options = ClusterOptions::make()->withWorkerMemoryLimit('256M');
+        $server = HttpServer::create()->withCluster(2, $options);
 
-        expect(getServerProperty($server, 'workerMemoryLimit'))->toBe('256M');
+        expect(getServerProperty($server, 'clusterOptions')->workerMemoryLimit)->toBe('256M');
     });
 
-    it('can configure cluster bootstrap files and callbacks', function () {
+    it('can configure cluster bootstrap files and callbacks in cluster options', function () {
         $callback = fn () => true;
-        $server = HttpServer::create()->withClusterBootstrap('/app/bootstrap.php', $callback);
+        $options = ClusterOptions::make()->withClusterBootstrap('/app/bootstrap.php', $callback);
+        $server = HttpServer::create()->withCluster(2, $options);
 
-        expect(getServerProperty($server, 'clusterBootstrapFile'))->toBe('/app/bootstrap.php')
-            ->and(getServerProperty($server, 'clusterBootstrapCallback'))->toBe($callback)
+        expect(getServerProperty($server, 'clusterOptions')->clusterBootstrapFile)->toBe('/app/bootstrap.php')
+            ->and(getServerProperty($server, 'clusterOptions')->clusterBootstrapCallback)->toBe($callback)
         ;
     });
 
@@ -181,22 +178,14 @@ describe('HttpServer Configuration & Instantiation', function () {
         ;
     });
 
-    it('has a default worker restart limit of 10', function () {
-        $server = HttpServer::create();
-
-        expect(getServerProperty($server, 'workerRestartLimit'))->toBe(10);
+    it('has a default worker restart limit of 10 inside ClusterOptions', function () {
+        $options = ClusterOptions::make();
+        expect($options->workerRestartLimit)->toBe(10);
     });
 
-    it('can configure worker restart limit', function () {
-        $server = HttpServer::create()->withWorkerRestartLimit(5);
-
-        expect(getServerProperty($server, 'workerRestartLimit'))->toBe(5);
-    });
-
-    it('can disable the worker restart limit explicitly by passing null', function () {
-        $server = HttpServer::create()->withWorkerRestartLimit(null);
-
-        expect(getServerProperty($server, 'workerRestartLimit'))->toBeNull();
+    it('can disable the worker restart limit explicitly by passing null inside ClusterOptions', function () {
+        $options = ClusterOptions::make()->withWorkerRestartLimit(null);
+        expect($options->workerRestartLimit)->toBeNull();
     });
 
     it('has a default maximum concurrent requests per connection of 128', function () {

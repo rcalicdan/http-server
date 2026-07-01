@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Hibla\HttpServer\Interfaces;
 
+use Hibla\HttpServer\ClusterOptions;
 use Hibla\HttpServer\Message\Request;
 use Hibla\HttpServer\Message\Response;
 use Hibla\Socket\Interfaces\ServerInterface;
@@ -47,10 +48,11 @@ interface HttpServerInterface
      * Explicitly enable multi-core clustering using SO_REUSEPORT.
      *
      * @param int $workers Number of workers to spawn. Must be explicitly provided.
+     * @param ClusterOptions|null $options Additional cluster options for worker configurations.
      *
      * @return static A new instance with clustering configured.
      */
-    public function withCluster(int $workers): static;
+    public function withCluster(int $workers, ?ClusterOptions $options = null): static;
 
     /**
      * Disable multi-core clustering and run entirely in the current process.
@@ -65,15 +67,6 @@ interface HttpServerInterface
      * @return static A new instance with logging disabled.
      */
     public function withoutLogging(): static;
-
-    /**
-     * Set a per-worker memory limit for cluster mode.
-     *
-     * @param string $limit Memory limit in a format accepted by ini_set().
-     *
-     * @return static A new instance with the memory limit configured.
-     */
-    public function withWorkerMemoryLimit(string $limit): static;
 
     /**
      * Configure the maximum allowed request body size for buffered requests.
@@ -119,16 +112,6 @@ interface HttpServerInterface
     public function withHeaderLimits(int $maxSize, int $maxCount): static;
 
     /**
-     * Set the maximum number of worker respawns allowed per second in cluster mode.
-     * Prevents infinite crash loops if a worker dies repeatedly.
-     *
-     * @param int $restartsPerSecond The max allowed respawns per second.
-     *
-     * @return static A new instance with the restart limit configured.
-     */
-    public function withWorkerRestartLimit(int $restartsPerSecond): static;
-
-    /**
      * Set the maximum time allowed to receive the complete HTTP request headers.
      * Prevents Slowloris attacks. Disabled by default.
      *
@@ -149,28 +132,28 @@ interface HttpServerInterface
     public function withKeepAliveTimeout(?float $seconds): static;
 
     /**
-     * Set a bootstrap file and/or callback to be executed specifically in each
-     * cluster worker process when using multi-core clustering.
+     * Register a late-stage runtime callback to be executed once per process immediately
+     * before the HTTP server binds to its socket and starts accepting connections.
      *
-     * **NOTE:** This method is a no-op (ignored) when running entirely in single-process
-     * mode (i.e., without configuring clustering via `withCluster()`).
+     * PHYSICAL LIFECYCLE ORDER (Clustered Mode):
+     *  1. Subprocess Spawned ──> 2. withClusterBootstrap() ──> 3. onStart() ──> 4. Socket Binds & Listens
      *
-     * @param string $file Absolute path to a PHP file to require.
-     * @param (callable(string $file): mixed)|null $callback Optional callback to run after file inclusion.
+     * This callback is executed once per active process context:
+     *  - In Single-Process Mode: Executed once in the main process before listening.
+     *  - In Cluster Mode: Executed once inside each isolated child subprocess before listening.
      *
-     * @return static A new instance with the cluster bootstrap logic configured.
-     */
-    public function withClusterBootstrap(string $file, ?callable $callback = null): static;
-
-    /**
-     * Register a callback to be executed once per process (once in single-process mode,
-     * or once per worker process in cluster mode) immediately before the HTTP server
-     * starts accepting connections.
+     * DESIGNATED USE CASES:
+     * Use this method for runtime resource initializations that require just-in-time opening:
+     *  - Establishing active database connection pools.
+     *  - Initializing active Redis or caching client connections.
+     *  - Compiling or resolving application Dependency Injection (DI) graph instances.
      *
-     * This is the designated place to initialize database connection pools, Redis clients,
-     * or any other stateful application resources.
+     * WHY DO THIS HERE?
+     * Initializing active socket connections inside withClusterBootstrap() can lead to idle timeouts,
+     * deadlocks, or socket leaks because those occur during early process spawning. Registering them here
+     * guarantees they are opened only when the HTTP engine is hot and ready to accept request traffic.
      *
-     * @param callable $callback
+     * @param callable $callback Lifecycle callback.
      *
      * @return static
      */

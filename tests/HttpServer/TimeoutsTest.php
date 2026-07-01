@@ -170,7 +170,7 @@ describe('Timeout Edge Cases', function () {
 
             $connection->on('close', function () use (&$isClosed) {
                 $isClosed = true;
-               
+
             });
 
             $connection->write("GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n");

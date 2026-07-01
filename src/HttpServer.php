@@ -46,14 +46,7 @@ final class HttpServer implements HttpServerInterface
 
     private ?ServerInterface $customSocketServer = null;
 
-    private ?string $workerMemoryLimit = null;
-
-    private ?string $clusterBootstrapFile = null;
-
-    /**
-     * @var (callable(string): mixed)|null
-     */
-    private $clusterBootstrapCallback = null;
+    private ?ClusterOptions $clusterOptions = null;
 
     /**
      * @var callable|null
@@ -63,8 +56,6 @@ final class HttpServer implements HttpServerInterface
     private ?float $headerTimeout = null;
 
     private ?float $keepAliveTimeout = null;
-
-    private ?int $workerRestartLimit = 10;
 
     /**
      * @var int Limit for concurrent requests per TCP connection
@@ -111,9 +102,9 @@ final class HttpServer implements HttpServerInterface
      *
      * @param string|int $address Port (e.g., 8080) or URI (e.g., '127.0.0.1:8000')
      *
-     * @return self
+     * @return HttpServerInterface
      */
-    public static function create(string|int $address = '0.0.0.0:8000'): self
+    public static function create(string|int $address = '0.0.0.0:8000'): HttpServerInterface
     {
         return new self($address);
     }
@@ -176,7 +167,7 @@ final class HttpServer implements HttpServerInterface
     /**
      * {@inheritdoc}
      */
-    public function withCluster(int $workers): static
+    public function withCluster(int $workers, ?ClusterOptions $options = null): static
     {
         if ($workers < 1) {
             throw new InvalidConfigurationException('Cluster mode requires at least 1 worker.');
@@ -185,17 +176,7 @@ final class HttpServer implements HttpServerInterface
         $clone = clone $this;
         $clone->clusterEnabled = true;
         $clone->workerCount = $workers;
-
-        return $clone;
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    public function withWorkerRestartLimit(?int $restartsPerSecond): static
-    {
-        $clone = clone $this;
-        $clone->workerRestartLimit = $restartsPerSecond;
+        $clone->clusterOptions = $options ?? ClusterOptions::make();
 
         return $clone;
     }
@@ -208,6 +189,7 @@ final class HttpServer implements HttpServerInterface
         $clone = clone $this;
         $clone->clusterEnabled = false;
         $clone->workerCount = 1;
+        $clone->clusterOptions = null;
 
         return $clone;
     }
@@ -219,29 +201,6 @@ final class HttpServer implements HttpServerInterface
     {
         $clone = clone $this;
         $clone->loggingEnabled = false;
-
-        return $clone;
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    public function withWorkerMemoryLimit(string $limit): static
-    {
-        $clone = clone $this;
-        $clone->workerMemoryLimit = $limit;
-
-        return $clone;
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    public function withClusterBootstrap(string $file, ?callable $callback = null): static
-    {
-        $clone = clone $this;
-        $clone->clusterBootstrapFile = $file;
-        $clone->clusterBootstrapCallback = $callback;
 
         return $clone;
     }
@@ -475,9 +434,6 @@ final class HttpServer implements HttpServerInterface
         Loop::run();
     }
 
-    /**
-     * Run the server in clustered mode across multiple CPU cores.
-     */
     private function runCluster(int $workers, callable $requestHandler): void
     {
         /** @var array<string, mixed> $context */
@@ -537,16 +493,23 @@ final class HttpServer implements HttpServerInterface
             })
         ;
 
-        if ($this->workerMemoryLimit !== null) {
-            $pool = $pool->withMemoryLimit($this->workerMemoryLimit);
-        }
+        $options = $this->clusterOptions;
 
-        if ($this->clusterBootstrapFile !== null) {
-            $pool = $pool->withBootstrap($this->clusterBootstrapFile, $this->clusterBootstrapCallback);
-        }
+        if ($options !== null) {
+            $memoryLimit = $options->workerMemoryLimit;
+            if ($memoryLimit !== null) {
+                $pool = $pool->withMemoryLimit($memoryLimit);
+            }
 
-        if ($this->workerRestartLimit !== null) {
-            $pool = $pool->withMaxRestartPerSecond($this->workerRestartLimit);
+            $bootstrapFile = $options->clusterBootstrapFile;
+            if ($bootstrapFile !== null) {
+                $pool = $pool->withBootstrap($bootstrapFile, $options->clusterBootstrapCallback);
+            }
+
+            $restartLimit = $options->workerRestartLimit;
+            if ($restartLimit !== null) {
+                $pool = $pool->withMaxRestartPerSecond($restartLimit);
+            }
         }
 
         $pool = $pool->onWorkerRespawn(function ($pool) use ($workerTask, $onWorkerError) {
@@ -597,7 +560,7 @@ final class HttpServer implements HttpServerInterface
 
             Loop::addSignal(self::SIGINT, $handler);
             Loop::addSignal(self::SIGTERM, $handler);
-        } catch (\BadMethodCallException $e) {
+        } catch (\BadMethodCallException) {
             // Signal handling falls back gracefully on unsupported platforms
         }
     }
