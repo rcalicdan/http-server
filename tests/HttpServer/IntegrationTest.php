@@ -10,6 +10,7 @@ use Hibla\Stream\Interfaces\ReadableStreamInterface;
 
 use function Hibla\await;
 use function Hibla\delay;
+use function Hibla\emit;
 
 function runConfigTest(callable $configureServer, callable $clientActions): void
 {
@@ -461,6 +462,53 @@ describe('Clustered Mode Advanced Integration Tests', function () {
 
                 if (file_exists($bootstrapFile)) {
                     unlink($bootstrapFile);
+                }
+            }
+        );
+    });
+
+    it('receives emitted messages from child workers in the master process via ClusterOptions', function () {
+        $ipcFile = sys_get_temp_dir() . '/hibla_ipc_test.log';
+        if (file_exists($ipcFile)) {
+            unlink($ipcFile);
+        }
+
+        runClusterConfigTest(
+            function ($address) use ($ipcFile) {
+                $options = ClusterOptions::make()
+                    ->onWorkerMessage(function ($message) use ($ipcFile) {
+                        if (($message->data['type'] ?? '') === 'custom_ipc') {
+                            file_put_contents($ipcFile, $message->data['value']);
+                        }
+                    })
+                ;
+
+                HttpServer::create($address)
+                    ->withCluster(1, $options)
+                    ->withoutLogging()
+                    ->start(function (Request $request) {
+                        emit(['type' => 'custom_ipc', 'value' => 'hello_from_worker_' . getmypid()]);
+
+                        return Response::plaintext('OK');
+                    })
+                ;
+            },
+            function ($address) use ($ipcFile) {
+                $fp = stream_socket_client("tcp://{$address}", $errno, $errstr, 1.0);
+                fwrite($fp, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+
+                $response = stream_get_contents($fp);
+                fclose($fp);
+
+                expect($response)->toContain('200 OK');
+
+                usleep(50000);
+
+                expect(file_exists($ipcFile))->toBeTrue();
+                expect(file_get_contents($ipcFile))->toStartWith('hello_from_worker_');
+
+                if (file_exists($ipcFile)) {
+                    unlink($ipcFile);
                 }
             }
         );

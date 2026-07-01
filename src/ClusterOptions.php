@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Hibla\HttpServer;
 
+use Hibla\Parallel\ValueObjects\WorkerMessage;
+
 /**
  * Encapsulates multi-process cluster configuration options for the high-level HTTP Server.
  *
@@ -22,6 +24,11 @@ final class ClusterOptions
      * @var (callable(string): mixed)|null
      */
     public private(set) mixed $clusterBootstrapCallback = null;
+
+    /**
+     * @var (callable(WorkerMessage): void)|null
+     */
+    public private(set) mixed $workerMessageCallback = null;
 
     /**
      * Named constructor for fluent chaining.
@@ -92,6 +99,27 @@ final class ClusterOptions
         $clone = clone $this;
         $clone->clusterBootstrapFile = $file;
         $clone->clusterBootstrapCallback = $callback;
+
+        return $clone;
+    }
+
+    /**
+     * Register a callback to handle messages sent from worker processes via emit().
+     *
+     * The handler is executed inside the master process's event loop and receives
+     * a WorkerMessage object containing the emitted data and the worker's PID.
+     *
+     * This enables powerful Inter-Process Communication (IPC) patterns like metrics
+     * aggregation, centralized logging, or state synchronization.
+     *
+     * @param callable(WorkerMessage): void $handler
+     *
+     * @return static
+     */
+    public function onWorkerMessage(callable $handler): static
+    {
+        $clone = clone $this;
+        $clone->workerMessageCallback = $handler;
 
         return $clone;
     }

@@ -496,19 +496,20 @@ final class HttpServer implements HttpServerInterface
         $options = $this->clusterOptions;
 
         if ($options !== null) {
-            $memoryLimit = $options->workerMemoryLimit;
-            if ($memoryLimit !== null) {
-                $pool = $pool->withMemoryLimit($memoryLimit);
+            if ($options->workerMessageCallback !== null) {
+                $pool = $pool->onMessage($options->workerMessageCallback);
             }
 
-            $bootstrapFile = $options->clusterBootstrapFile;
-            if ($bootstrapFile !== null) {
-                $pool = $pool->withBootstrap($bootstrapFile, $options->clusterBootstrapCallback);
+            if ($options->workerMemoryLimit !== null) {
+                $pool = $pool->withMemoryLimit($options->workerMemoryLimit);
             }
 
-            $restartLimit = $options->workerRestartLimit;
-            if ($restartLimit !== null) {
-                $pool = $pool->withMaxRestartPerSecond($restartLimit);
+            if ($options->clusterBootstrapFile !== null) {
+                $pool = $pool->withBootstrap($options->clusterBootstrapFile, $options->clusterBootstrapCallback);
+            }
+
+            if ($options->workerRestartLimit !== null) {
+                $pool = $pool->withMaxRestartPerSecond($options->workerRestartLimit);
             }
         }
 
@@ -535,11 +536,8 @@ final class HttpServer implements HttpServerInterface
 
             $this->log("\nGracefully shutting down cluster...");
 
-            // Explicitly forward the shutdown signal to all child workers.
-            // This ensures graceful shutdown works perfectly in Docker
-            // and in your integration tests!
             foreach ($pool->getWorkerPids() as $workerPid) {
-                @posix_kill($workerPid, SIGTERM);
+                @posix_kill($workerPid, self::SIGTERM);
             }
 
             $pool->drain();
