@@ -100,7 +100,7 @@ final class Request extends AbstractMessage
                 if ($tmpPath === false) {
                     return;
                 }
-                
+
                 $destination = Stream::writableFile($tmpPath);
 
                 /** @var Promise<null> $writePromise */
@@ -178,11 +178,13 @@ final class Request extends AbstractMessage
                 if (\count($writePromises) === 0) {
                     /** @var PromiseInterface<null> $nullPromise */
                     $nullPromise = Promise::resolved(null);
+
                     return $nullPromise;
                 }
 
                 /** @var PromiseInterface<array<int|string, null>> $allPromise */
                 $allPromise = Promise::all($writePromises);
+
                 return $allPromise;
             })->then(static function () use ($resolve, $form) {
                 $resolve($form);

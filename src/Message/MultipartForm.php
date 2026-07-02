@@ -25,11 +25,11 @@ final class MultipartForm
     {
         if (str_ends_with($name, '[]')) {
             $cleanName = substr($name, 0, -2);
-            
+
             if (! isset($this->files[$cleanName]) || ! \is_array($this->files[$cleanName])) {
                 $this->files[$cleanName] = [];
             }
-            
+
             $this->files[$cleanName][] = $file;
         } else {
             $this->files[$name] = $file;
